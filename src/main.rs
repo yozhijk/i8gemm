@@ -1,6 +1,42 @@
 use ash::{Entry, vk};
+use clap::Parser;
+
+mod tensor;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, disable_help_flag = true)]
+struct Args {
+    /// Tensor input channels
+    #[arg(short, long, default_value_t = 1024)]
+    in_channels: usize,
+
+    /// Tensor output channels
+    #[arg(short, long, default_value_t = 1024)]
+    out_channels: usize,
+
+    /// Tensor width
+    #[arg(short, long, default_value_t = 1024)]
+    width: usize,
+
+    /// Tensor height
+    #[arg(short, long, default_value_t = 1024)]
+    height: usize,
+
+    /// Number of tests
+    #[arg(short, long, default_value_t = 100)]
+    tests: usize,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Args = Parser::parse();
+
+    println!("Benchmarking with:");
+    println!(
+        "I: {}, O: {}, W: {}, H: {}",
+        args.in_channels, args.out_channels, args.width, args.height
+    );
+    println!("# of iterations: {}", args.tests);
+
     // 1. Load Vulkan Entry
     //    (This loads the Vulkan dynamic library from the system)
     let entry = unsafe { Entry::load()? };
@@ -40,7 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- FP8 GEMM SPECIFIC SETUP START ---
     let extension_names = [
-        // vk::KhrCooperativeMatrixFn::name().as_ptr(), 
+        c"VK_KHR_cooperative_matrix".as_ptr(),
+        // vk::KhrCooperativeMatrixFn::name().as_ptr(),
         // CStr::from_bytes_with_nul(b"VK_EXT_shader_float8\0")?.as_ptr(),
         // CStr::from_bytes_with_nul(b"VK_KHR_vulkan_memory_model\0")?.as_ptr(),
     ];
@@ -59,6 +96,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = unsafe { instance.create_device(*pdevice, &device_create_info, None)? };
 
     println!("Vulkan Compute Device Created Successfully!");
+
+    // 7. Load SPIRV
+    //
+    // Note: This path is relative to the file where this macro is called (src/main.rs)
+    let shader_code = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
+    println!("Shader bytecode length: {}", shader_code.len());
 
     // 7. Cleanup
     unsafe {
