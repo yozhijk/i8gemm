@@ -24,77 +24,72 @@ const int N_TILE = 16;
 const int K_TILE = 16; 
 
 // --- Buffers ---
-// A: MxK matrix (Row Major), stored as 8-bit values
-layout(set = 0, binding = 0) readonly buffer BufA {
-    uint8_t dataA[]; 
+layout(set = 0, binding = 0) readonly buffer Input {
+    uint t_input[]; 
 };
 
-// B: KxN matrix (Column Major is usually faster for B, but let's assume Row Major for simplicity)
-layout(set = 0, binding = 1) readonly buffer BufB {
-    uint8_t dataB[];
+layout(set = 0, binding = 1) readonly buffer Weight {
+    uint t_weight[];
 };
 
-// C: MxN matrix (Row Major), stored as FP16 or FP32
-layout(set = 0, binding = 2) buffer BufC {
-    float16_t dataC[];
+layout(set = 0, binding = 2) buffer Output {
+    uint t_output[];
 };
 
 // Push Constants for dynamic dimensions
-layout(push_constant) uniform PushConsts {
-    uint M;
-    uint N;
-    uint K;
-} p;
+//layout(push_constant) uniform PushConsts {
+//    uint
+//} p;
 
 void main() {
-    // 1. Define Matrix Types
-    //    Scope: Subgroup (Standard for Vulkan)
-    //    Storage: We use uint8_t for A/B to represent the raw 8 bits.
-    //             The hardware "Cooperative Matrix Properties" must match this signature.
-    //             (A=Uint8, B=Uint8, C=Float16, Result=Float16)
-    //
-    //    NOTE: If your driver exposes specific float8 e4m3 types in GLSL, use them here.
-    //          Many drivers currently map (uint8, uint8) -> float16 ops if the 
-    //          CooperativeMatrixProperties say "A_Type = FLOAT8_E4M3".
-    coopmat<uint8_t,   gl_ScopeSubgroup, M_TILE, K_TILE, gl_MatrixUseA> matA;
-    coopmat<uint8_t,   gl_ScopeSubgroup, K_TILE, N_TILE, gl_MatrixUseB> matB;
-    coopmat<float16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator> matC;
-
-    // 2. Initialize Accumulator (C) to 0
-    matC = coopmat<float16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator>(0.0);
-
-    // 3. Tile Coordinates
-    //    (Assume grid is dispatched such that gl_WorkGroupID covers the matrix dimensions)
-    uint globalRow = gl_WorkGroupID.y * M_TILE;
-    uint globalCol = gl_WorkGroupID.x * N_TILE;
-
-    // 4. Loop over K dimension
-    for (uint k = 0; k < p.K; k += K_TILE) {
-        // --- Load A ---
-        // Need to verify bounds if K is not multiple of 16
-        // Address: Row * Stride + Col
-        // For A (RowMajor): dataA[globalRow...][k...]
-        // Note: coopMatLoad requires a base index and a stride (elements per row)
-        // Stride for A = K (total columns)
-        uint idxA = globalRow * p.K + k;
-        
-        // Load params: (matrix_obj, buffer_array, start_index, stride, layout)
-        coopMatLoad(matA, dataA, idxA, p.K, gl_CooperativeMatrixLayoutRowMajor);
-
-        // --- Load B ---
-        // For B (assume RowMajor KxN): dataB[k...][globalCol...]
-        // Stride for B = N
-        uint idxB = k * p.N + globalCol;
-        
-        // Using RowMajor for B is often slower/trickier for hardware, but valid.
-        coopMatLoad(matB, dataB, idxB, p.N, gl_CooperativeMatrixLayoutRowMajor);
-
-        // --- Multiply & Accumulate ---
-        // Result = A * B + C
-        matC = coopMatMulAdd(matA, matB, matC);
-    }
-
-    // 5. Store Result
-    uint idxC = globalRow * p.N + globalCol;
-    coopMatStore(matC, dataC, idxC, p.N, gl_CooperativeMatrixLayoutRowMajor);
+//    // 1. Define Matrix Types
+//    //    Scope: Subgroup (Standard for Vulkan)
+//    //    Storage: We use uint8_t for A/B to represent the raw 8 bits.
+//    //             The hardware "Cooperative Matrix Properties" must match this signature.
+//    //             (A=Uint8, B=Uint8, C=Float16, Result=Float16)
+//    //
+//    //    NOTE: If your driver exposes specific float8 e4m3 types in GLSL, use them here.
+//    //          Many drivers currently map (uint8, uint8) -> float16 ops if the 
+//    //          CooperativeMatrixProperties say "A_Type = FLOAT8_E4M3".
+//    coopmat<uint8_t,   gl_ScopeSubgroup, M_TILE, K_TILE, gl_MatrixUseA> matA;
+//    coopmat<uint8_t,   gl_ScopeSubgroup, K_TILE, N_TILE, gl_MatrixUseB> matB;
+//    coopmat<float16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator> matC;
+//
+//    // 2. Initialize Accumulator (C) to 0
+//    matC = coopmat<float16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator>(0.0);
+//
+//    // 3. Tile Coordinates
+//    //    (Assume grid is dispatched such that gl_WorkGroupID covers the matrix dimensions)
+//    uint globalRow = gl_WorkGroupID.y * M_TILE;
+//    uint globalCol = gl_WorkGroupID.x * N_TILE;
+//
+//    // 4. Loop over K dimension
+//    for (uint k = 0; k < p.K; k += K_TILE) {
+//        // --- Load A ---
+//        // Need to verify bounds if K is not multiple of 16
+//        // Address: Row * Stride + Col
+//        // For A (RowMajor): dataA[globalRow...][k...]
+//        // Note: coopMatLoad requires a base index and a stride (elements per row)
+//        // Stride for A = K (total columns)
+//        uint idxA = globalRow * p.K + k;
+//        
+//        // Load params: (matrix_obj, buffer_array, start_index, stride, layout)
+//        coopMatLoad(matA, dataA, idxA, p.K, gl_CooperativeMatrixLayoutRowMajor);
+//
+//        // --- Load B ---
+//        // For B (assume RowMajor KxN): dataB[k...][globalCol...]
+//        // Stride for B = N
+//        uint idxB = k * p.N + globalCol;
+//        
+//        // Using RowMajor for B is often slower/trickier for hardware, but valid.
+//        coopMatLoad(matB, dataB, idxB, p.N, gl_CooperativeMatrixLayoutRowMajor);
+//
+//        // --- Multiply & Accumulate ---
+//        // Result = A * B + C
+//        matC = coopMatMulAdd(matA, matB, matC);
+//    }
+//
+//    // 5. Store Result
+//    uint idxC = globalRow * p.N + globalCol;
+//    coopMatStore(matC, dataC, idxC, p.N, gl_CooperativeMatrixLayoutRowMajor);
 }

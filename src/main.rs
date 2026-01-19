@@ -1,8 +1,10 @@
+use ash::util::read_spv;
 use ash::{
-    Entry,
+    Device, Entry,
     vk::{self, ComputePipelineCreateInfo},
 };
 use clap::Parser;
+use std::io::Cursor;
 //use renderdoc::RenderDoc;
 
 mod data;
@@ -61,6 +63,42 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
         vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
     } else {
         vk::InstanceCreateFlags::default()
+    }
+}
+
+pub fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
+    // Define the 3 bindings corresponding to your shader:
+    // layout(binding = 0) buffer Input { ... }
+    // layout(binding = 1) buffer Weight { ... }
+    // layout(binding = 2) buffer Output { ... }
+
+    unsafe {
+        let bindings = [
+            // Binding 0: Input tensor
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Binding 1: Weights tensor
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Binding 2: Output tensor
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+        device
+            .create_descriptor_set_layout(&layout_info, None)
+            .expect("Failed to create descriptor set layout")
     }
 }
 
@@ -144,15 +182,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Load SPIRV
     //
     // Note: This path is relative to the file where this macro is called (src/main.rs)
-    let shader_code = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
+    let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
+    let shader_code = read_spv(&mut Cursor::new(shader_bytes)).unwrap();
     println!("Shader bytecode length: {}", shader_code.len());
 
-    //let shader_module_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-    //let shader_module = unsafe { device.create_shader_module(shader_module_info, None) };
+    // Create shader module
+    let shader_module_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
+    let shader_module = unsafe {
+        device
+            .create_shader_module(&shader_module_info, None)
+            .unwrap()
+    };
 
-    //pipe_create_info = vk::ComputePipelineCreateInfo::default()
-    //    .device
-    //    .create_compute_pipelines(None, &[pipe_create_info], None);
+    // Create descriptor set layout
+    let desc_set_layout = create_descriptor_set_layout(&device);
+    let desc_set_layouts = [desc_set_layout];
+    let pipeline_layout_info =
+        vk::PipelineLayoutCreateInfo::default().set_layouts(&desc_set_layouts);
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .unwrap()
+    };
+
+    let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader_module)
+        .name(c"main");
+
+    let pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .layout(pipeline_layout)
+        .stage(stage_create_info);
+
+    let pipeline = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            .expect("Failed to create compute pipeline")[0]
+    };
 
     // 8. Create device buffers
     let pool_create_info = vk::CommandPoolCreateInfo::default();
@@ -231,6 +297,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_output.destroy(&device);
         t_weight.destroy(&device);
 
+        device.destroy_descriptor_set_layout(desc_set_layout, None);
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_shader_module(shader_module, None);
+        device.destroy_pipeline(pipeline, None);
         device.destroy_command_pool(command_pool, None);
         device.destroy_device(None);
         instance.destroy_instance(None);
