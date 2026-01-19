@@ -36,6 +36,34 @@ struct Args {
     tests: usize,
 }
 
+fn get_required_layers() -> Vec<*const i8> {
+    vec![c"VK_LAYER_KHRONOS_validation".as_ptr()]
+}
+
+fn get_required_instance_extensions() -> Vec<*const i8> {
+    if cfg!(target_os = "macos") {
+        vec![c"VK_KHR_portability_enumeration".as_ptr()]
+    } else {
+        vec![]
+    }
+}
+
+fn get_required_device_extensions() -> Vec<*const i8> {
+    if cfg!(target_os = "macos") {
+        vec![c"VK_KHR_portability_subset".as_ptr()]
+    } else {
+        vec![c"VK_KHR_cooperative_matrix".as_ptr()]
+    }
+}
+
+fn get_required_instance_flags() -> vk::InstanceCreateFlags {
+    if cfg!(target_os = "macos") {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::default()
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = Parser::parse();
 
@@ -62,10 +90,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    We request Vulkan 1.3 because of Cooperative Matrix
     let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
 
-    let layer_names = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
+    let layer_names = get_required_layers();
+    let layer_extension_names = get_required_instance_extensions();
     let instance_create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
-        .enabled_layer_names(&layer_names);
+        .enabled_layer_names(&layer_names)
+        .enabled_extension_names(&layer_extension_names)
+        .flags(get_required_instance_flags());
 
     let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
 
@@ -92,12 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .queue_priorities(&queue_priorities);
 
     // --- FP8 GEMM SPECIFIC SETUP START ---
-    let extension_names = [
-        c"VK_KHR_cooperative_matrix".as_ptr(),
-        // vk::KhrCooperativeMatrixFn::name().as_ptr(),
-        // CStr::from_bytes_with_nul(b"VK_EXT_shader_float8\0")?.as_ptr(),
-        // CStr::from_bytes_with_nul(b"VK_KHR_vulkan_memory_model\0")?.as_ptr(),
-    ];
+    let extension_names = get_required_device_extensions();
 
     // You will also need to chain specific feature structs here (p_next)
     // e.g., vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
