@@ -15,13 +15,12 @@
 // OR simply define the matrix inputs as uint8_t and the hardware config handles the interpretation.
 // #extension GL_EXT_shader_explicit_arithmetic_types_float8 : enable 
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // --- Constants (Specialization Constants are better for prod) ---
 // Cooperative Matrix Size: 16x16 is the most standard cross-vendor tile size.
-const int M_TILE = 16;
-const int N_TILE = 16;
-const int K_TILE = 16; 
+const int IC_SLICE = 16;
+const int OC_SLICE = 16;
 
 // --- Buffers ---
 layout(set = 0, binding = 0) readonly buffer Input {
@@ -37,9 +36,36 @@ layout(set = 0, binding = 2) buffer Output {
 };
 
 // Push Constants for dynamic dimensions
-//layout(push_constant) uniform PushConsts {
-//    uint
-//} p;
+layout(push_constant) uniform PushConsts {
+    uint num_ic;
+    uint num_oc;
+    uint height;
+    uint width;
+    uint pad[4];
+} p;
+
+uint get_input_elem(uint ic, uint y, uint x) {
+    if (y < 0 || y >= p.height || x < 0 || x >= p.width)
+    {
+        return 0;
+    }
+
+    return t_input[ic * p.height * p.width + y * p.width + x];
+}
+uint store_output_elem(uint oc, uint y, uint x, uint val) {
+    if (y < 0 || y >= p.height || x < 0 || x >= p.width)
+    {
+        return 0;
+    }
+
+    t_output[oc * p.height * p.width + y * p.width + x] = val;
+}
+
+uint get_weight_3x3(uint oc, uint ic, uint dy, uint dx) {
+    uint y = dy + 1;
+    uint x = dx + 1;
+    return t_weight[oc * p.num_ic * 3 * 3 + ic * 3 * 3 + y * 3 + x];
+}
 
 void main() {
 //    // 1. Define Matrix Types
@@ -92,4 +118,20 @@ void main() {
 //    // 5. Store Result
 //    uint idxC = globalRow * p.N + globalCol;
 //    coopMatStore(matC, dataC, idxC, p.N, gl_CooperativeMatrixLayoutRowMajor);
+    uint out_x = gl_GlobalInvocationID.x;
+    uint out_y = gl_GlobalInvocationID.y;
+
+    if (out_x < p.width && out_y < p.height) {
+        for (int oc = 0; oc < p.num_oc; ++oc) {
+            uint res = 0;
+            for (int ic = 0; ic < p.num_ic; ++ic) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy){
+                        res += get_input_elem(ic, out_y + dy, out_x + dx) * get_weight_3x3(oc, ic, dy, dx);
+                    }
+                }
+            }
+            store_output_elem(oc, out_y, out_x, res);
+        }
+    }
 }

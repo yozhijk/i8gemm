@@ -1,11 +1,12 @@
 use ash::util::read_spv;
+use ash::vk::DescriptorSetLayout;
 use ash::{
     Device, Entry,
-    vk::{self, ComputePipelineCreateInfo},
+    vk::{self},
 };
 use clap::Parser;
-use std::io::Cursor;
 //use renderdoc::RenderDoc;
+use std::io::Cursor;
 
 mod data;
 mod device_buffer;
@@ -38,6 +39,16 @@ struct Args {
     tests: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PushConstants {
+    pub num_ic: u32,
+    pub num_oc: u32,
+    pub height: u32,
+    pub width: u32,
+    pub pad: [u32; 4],
+}
+
 fn get_required_layers() -> Vec<*const i8> {
     vec![c"VK_LAYER_KHRONOS_validation".as_ptr()]
 }
@@ -54,7 +65,8 @@ fn get_required_device_extensions() -> Vec<*const i8> {
     if cfg!(target_os = "macos") {
         vec![c"VK_KHR_portability_subset".as_ptr()]
     } else {
-        vec![c"VK_KHR_cooperative_matrix".as_ptr()]
+        //vec![c"VK_KHR_cooperative_matrix".as_ptr()]
+        vec![]
     }
 }
 
@@ -66,12 +78,11 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
     }
 }
 
-pub fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
+fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
     // Define the 3 bindings corresponding to your shader:
     // layout(binding = 0) buffer Input { ... }
     // layout(binding = 1) buffer Weight { ... }
     // layout(binding = 2) buffer Output { ... }
-
     unsafe {
         let bindings = [
             // Binding 0: Input tensor
@@ -102,6 +113,50 @@ pub fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout 
     }
 }
 
+fn create_compute_pipeline(
+    device: &Device,
+    desc_set_layout: &DescriptorSetLayout,
+) -> (vk::Pipeline, vk::PipelineLayout) {
+    unsafe {
+        // Load SPIRV
+        // Note: This path is relative to the file where this macro is called (src/main.rs)
+        let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
+        let shader_code = read_spv(&mut Cursor::new(shader_bytes)).unwrap();
+
+        // Create shader module
+        let shader_module_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
+        let shader_module = device
+            .create_shader_module(&shader_module_info, None)
+            .expect("Error creating shader module");
+
+        // Create pipeline layout
+        let desc_set_layouts = [*desc_set_layout];
+        let push_constants_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<PushConstants>() as u32)];
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&desc_set_layouts)
+            .push_constant_ranges(&push_constants_ranges);
+        let pipeline_layout = device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .expect("Cannot create pipeline layout");
+        let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(c"main");
+        let pipeline_create_info = vk::ComputePipelineCreateInfo::default()
+            .layout(pipeline_layout)
+            .stage(stage_create_info);
+        let pipeline = device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_create_info], None)
+            .expect("Failed to create compute pipeline")[0];
+
+        device.destroy_shader_module(shader_module, None);
+        (pipeline, pipeline_layout)
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = Parser::parse();
 
@@ -120,12 +175,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RenderDoc
     // rd.start_frame_capture(std::ptr::null(), std::ptr::null());
 
-    // 1. Load Vulkan Entry
-    //    (This loads the Vulkan dynamic library from the system)
+    // Load Vulkan Entry
+    // (This loads the Vulkan dynamic library from the system)
     let entry = unsafe { Entry::load()? };
 
-    // 2. Create Instance
-    //    We request Vulkan 1.3 because of Cooperative Matrix
+    // Create Instance
+    // We request Vulkan 1.3 because of Cooperative Matrix
     let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
 
     let layer_names = get_required_layers();
@@ -138,12 +193,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
 
-    // 3. Pick Physical Device (GPU)
-    //    We just pick the first one.
+    // Pick Physical Device (GPU), just pick the first one
     let pdevices = unsafe { instance.enumerate_physical_devices()? };
     let pdevice = pdevices.first().expect("No Vulkan physical device found!");
 
-    // 4. Find a Compute Queue Family
+    // Find a compute queue family
     let queue_family_properties =
         unsafe { instance.get_physical_device_queue_family_properties(*pdevice) };
 
@@ -154,7 +208,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(index, _)| index as u32)
         .expect("No Compute Queue found!");
 
-    // 5. Define Device Creation Info
     let queue_priorities = [1.0];
     let queue_create_info = vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family_index)
@@ -173,54 +226,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enabled_extension_names(&extension_names);
     //        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
 
-    // 6. Create Logical Device
+    // Create logical device
     let device = unsafe { instance.create_device(*pdevice, &device_create_info, None)? };
     let command_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-
     println!("Vulkan Compute Device Created Successfully!");
 
-    // 7. Load SPIRV
-    //
-    // Note: This path is relative to the file where this macro is called (src/main.rs)
-    let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
-    let shader_code = read_spv(&mut Cursor::new(shader_bytes)).unwrap();
-    println!("Shader bytecode length: {}", shader_code.len());
-
-    // Create shader module
-    let shader_module_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-    let shader_module = unsafe {
-        device
-            .create_shader_module(&shader_module_info, None)
-            .unwrap()
-    };
-
-    // Create descriptor set layout
+    // Create compute pipeline
     let desc_set_layout = create_descriptor_set_layout(&device);
-    let desc_set_layouts = [desc_set_layout];
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfo::default().set_layouts(&desc_set_layouts);
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .unwrap()
-    };
+    let (pipeline, pipeline_layout) = create_compute_pipeline(&device, &desc_set_layout);
 
-    let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader_module)
-        .name(c"main");
-
-    let pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .layout(pipeline_layout)
-        .stage(stage_create_info);
-
-    let pipeline = unsafe {
-        device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-            .expect("Failed to create compute pipeline")[0]
-    };
-
-    // 8. Create device buffers
+    //  Create device buffers
     let pool_create_info = vk::CommandPoolCreateInfo::default();
 
     let command_pool = unsafe { device.create_command_pool(&pool_create_info, None).unwrap() };
@@ -258,6 +273,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run compute pass
     // --- 3. Record Copy Command ---
     unsafe {
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(3)];
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(1);
+
+        let descriptor_pool = device
+            .create_descriptor_pool(&pool_info, None)
+            .expect("Failed to create descriptor pool");
+
+        // --- 2. Allocate the Descriptor Set ---
+        let desc_set_layouts = [desc_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&desc_set_layouts);
+
+        let descriptor_sets = device
+            .allocate_descriptor_sets(&alloc_info)
+            .expect("Failed to allocate descriptor sets");
+
+        let descriptor_set = descriptor_sets[0];
+
+        let info_input = [vk::DescriptorBufferInfo::default()
+            .buffer(t_input.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+
+        let info_weight = [vk::DescriptorBufferInfo::default()
+            .buffer(t_weight.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+
+        let info_output = [vk::DescriptorBufferInfo::default()
+            .buffer(t_output.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+
+        let write_sets = [
+            // Binding 0: Input tensor
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info_input),
+            // Binding 1: Weight tensor
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info_weight),
+            // Binding 2: Output tensor
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info_output),
+        ];
+
+        device.update_descriptor_sets(&write_sets, &[]);
+
         let allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -272,6 +349,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .begin_command_buffer(command_buffer, &begin_info)
             .unwrap();
 
+        // Bind Pipeline
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+
+        // Bind Descriptors
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline_layout,
+            0, // First set index
+            &[descriptor_set],
+            &[], // Dynamic offsets
+        );
+
+        let constants = PushConstants {
+            num_ic: args.in_channels as u32,
+            num_oc: args.out_channels as u32,
+            height: args.height as u32,
+            width: args.width as u32,
+            pad: [42, 11, 5, 16],
+        };
+
+        // "Serialize" struct to bytes (unsafe cast)
+        let constants_ptr = &constants as *const PushConstants as *const u8;
+        let constants_bytes =
+            std::slice::from_raw_parts(constants_ptr, std::mem::size_of::<PushConstants>());
+
+        device.cmd_push_constants(
+            command_buffer,
+            pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0, // offset
+            constants_bytes,
+        );
+
+        // Calculate Dispatch Dimensions
+        // CAUTION: This depends entirely on your shader's local_size_x/y
+        let workgroup_size = 8;
+        let group_count_x = args.width.div_ceil(workgroup_size);
+        let group_count_y = args.height.div_ceil(workgroup_size);
+
+        // Dispatch
+        device.cmd_dispatch(
+            command_buffer,
+            group_count_x as u32,
+            group_count_y as u32,
+            1,
+        );
+
         device.end_command_buffer(command_buffer).unwrap();
 
         // --- 4. Submit and Wait ---
@@ -282,6 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .queue_submit(queue, &[submit_info], vk::Fence::null())
             .unwrap();
         device.queue_wait_idle(queue).unwrap(); // Wait for copy to finish
+        device.destroy_descriptor_pool(descriptor_pool, None);
     }
 
     // Download data
@@ -299,7 +425,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         device.destroy_descriptor_set_layout(desc_set_layout, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
-        device.destroy_shader_module(shader_module, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_command_pool(command_pool, None);
         device.destroy_device(None);
