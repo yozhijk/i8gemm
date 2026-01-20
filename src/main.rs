@@ -59,6 +59,8 @@ pub struct VulkanApi {
     pub command_pool: vk::CommandPool,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub desc_pool: vk::DescriptorPool,
+    pub query_pool: vk::QueryPool,
+    pub props: vk::PhysicalDeviceProperties,
 }
 
 fn get_required_layers() -> Vec<*const i8> {
@@ -171,6 +173,18 @@ fn create_vulkan_api() -> VulkanApi {
             .create_descriptor_pool(&pool_info, None)
             .expect("Failed to create descriptor pool");
 
+        // 1. Get Timestamp Period (ns per tick)
+        let props = instance.get_physical_device_properties(*pdevice);
+
+        // 2. Create Query Pool for 2 timestamps (Start & End)
+        let create_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2); // Index 0 = Start, Index 1 = End
+
+        let query_pool = device
+            .create_query_pool(&create_info, None)
+            .expect("Failed to create query pool");
+
         VulkanApi {
             entry,
             instance,
@@ -180,6 +194,8 @@ fn create_vulkan_api() -> VulkanApi {
             command_pool,
             mem_props,
             desc_pool,
+            query_pool,
+            props,
         }
     }
 }
@@ -324,6 +340,44 @@ fn create_descriptor_set(
     }
 }
 
+pub fn get_execution_time_ns(
+    device: &Device,
+    query_pool: vk::QueryPool,
+    timestamp_period: f32,
+) -> f64 {
+    unsafe {
+        // Array to hold the two 64-bit timestamps
+        let mut timestamps = [0u64; 2];
+
+        // Fetch results from the GPU
+        // flag VK_QUERY_RESULT_64_BIT is critical to get u64 instead of u32
+        // flag VK_QUERY_RESULT_WAIT ensures we don't return until data is ready
+        let result = device.get_query_pool_results(
+            query_pool,
+            0,
+            &mut timestamps, // Output buffer
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        );
+
+        match result {
+            Ok(_) => {
+                let start = timestamps[0];
+                let end = timestamps[1];
+
+                // Calculate delta ticks
+                let delta_ticks = end.wrapping_sub(start);
+
+                // Convert to nanoseconds
+                (delta_ticks as f64) * (timestamp_period as f64)
+            }
+            Err(e) => {
+                eprintln!("Failed to get query results: {:?}", e);
+                0.0
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = Parser::parse();
 
@@ -438,6 +492,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             constants_bytes,
         );
 
+        device.cmd_reset_query_pool(command_buffer, api.query_pool, 0, 2);
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            api.query_pool,
+            0,
+        );
+
         // Calculate Dispatch Dimensions
         // CAUTION: This depends entirely on your shader's local_size_x/y
         let workgroup_size = 8;
@@ -452,6 +514,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1,
         );
 
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            api.query_pool,
+            1,
+        );
+
         device.end_command_buffer(command_buffer).unwrap();
 
         // --- 4. Submit and Wait ---
@@ -461,6 +530,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .queue_submit(queue, &[submit_info], vk::Fence::null())
             .unwrap();
         device.queue_wait_idle(queue).unwrap(); // Wait for copy to finish
+
+        let gpu_time =
+            get_execution_time_ns(&device, api.query_pool, api.props.limits.timestamp_period);
+
+        println!("Dispatch took: {:.3} ms", gpu_time / 1e6);
+
         device.destroy_descriptor_pool(api.desc_pool, None);
     }
 
@@ -477,6 +552,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_output.destroy(&device);
         t_weight.destroy(&device);
 
+        device.destroy_query_pool(api.query_pool, None);
         device.destroy_descriptor_set_layout(desc_set_layout, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_pipeline(pipeline, None);
