@@ -1,7 +1,7 @@
 use ash::util::read_spv;
 use ash::vk::DescriptorSetLayout;
 use ash::{
-    Device, Entry,
+    Device, Entry, Instance,
     vk::{self},
 };
 use clap::Parser;
@@ -49,6 +49,14 @@ pub struct PushConstants {
     pub pad: [u32; 4],
 }
 
+pub struct VulkanApi {
+    pub entry: Entry,
+    pub instance: Instance,
+    pub pdevice: vk::PhysicalDevice,
+    pub device: Device,
+    pub queue: vk::Queue
+}
+
 fn get_required_layers() -> Vec<*const i8> {
     vec![c"VK_LAYER_KHRONOS_validation".as_ptr()]
 }
@@ -76,6 +84,70 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
     } else {
         vk::InstanceCreateFlags::default()
     }
+}
+
+fn create_vulkan_api() -> VulkanApi {
+    unsafe {
+        // Load Vulkan Entry
+        // (This loads the Vulkan dynamic library from the system)
+        let entry =  Entry::load().expect("Cannot create Vulkan entry");
+
+        // Create Instance
+        // We request Vulkan 1.3 because of Cooperative Matrix
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+
+        let layer_names = get_required_layers();
+        let layer_extension_names = get_required_instance_extensions();
+        let instance_create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_layer_names(&layer_names)
+            .enabled_extension_names(&layer_extension_names)
+            .flags(get_required_instance_flags());
+
+        let instance = entry.create_instance(&instance_create_info, None).expect ("Cannot create Vulkan instance");
+
+        // Pick Physical Device (GPU), just pick the first one
+        let pdevices = instance.enumerate_physical_devices().expect("Cannot enumerate physical devices");
+        let pdevice = pdevices.first().expect("No Vulkan physical device found!");
+        let queue_family_properties = instance.get_physical_device_queue_family_properties(*pdevice);
+
+        let queue_family_index = queue_family_properties
+            .iter()
+            .enumerate()
+            .find(|(_, info)| info.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|(index, _)| index as u32)
+            .expect("No Compute Queue found!");
+
+        let queue_priorities = [1.0];
+        let queue_create_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&queue_priorities);
+
+        // --- FP8 GEMM SPECIFIC SETUP START ---
+        let extension_names = get_required_device_extensions();
+
+        // You will also need to chain specific feature structs here (p_next)
+        // e.g., vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
+        // let mut features13 = vk::PhysicalDeviceVulkan13Features::default().compute_full_subgroups(true);
+        // --- FP8 GEMM SPECIFIC SETUP END ---
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_create_info))
+            .enabled_extension_names(&extension_names);
+        //        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
+
+        // Create logical device
+        let device = instance.create_device(*pdevice, &device_create_info, None).expect("Cannot create Vulkan device");
+        let queue = device.get_device_queue(queue_family_index, 0);
+
+        VulkanApi {
+            entry,
+            instance,
+            pdevice: *pdevice,
+            device,
+            queue
+        }
+   }
 }
 
 fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
@@ -177,60 +249,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load Vulkan Entry
     // (This loads the Vulkan dynamic library from the system)
-    let entry = unsafe { Entry::load()? };
+    // let entry = unsafe { Entry::load()? };
 
     // Create Instance
     // We request Vulkan 1.3 because of Cooperative Matrix
-    let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+    // let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
 
-    let layer_names = get_required_layers();
-    let layer_extension_names = get_required_instance_extensions();
-    let instance_create_info = vk::InstanceCreateInfo::default()
-        .application_info(&app_info)
-        .enabled_layer_names(&layer_names)
-        .enabled_extension_names(&layer_extension_names)
-        .flags(get_required_instance_flags());
+    //let layer_names = get_required_layers();
+    //let layer_extension_names = get_required_instance_extensions();
+    //let instance_create_info = vk::InstanceCreateInfo::default()
+    //    .application_info(&app_info)
+    //    .enabled_layer_names(&layer_names)
+    //    .enabled_extension_names(&layer_extension_names)
+    //    .flags(get_required_instance_flags());
 
-    let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
+    //let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
+    let api = create_vulkan_api();
 
     // Pick Physical Device (GPU), just pick the first one
-    let pdevices = unsafe { instance.enumerate_physical_devices()? };
-    let pdevice = pdevices.first().expect("No Vulkan physical device found!");
+    // let pdevices = unsafe { api.instance.enumerate_physical_devices()? };
+    // let pdevice = pdevices.first().expect("No Vulkan physical device found!");
 
     // Find a compute queue family
-    let queue_family_properties =
-        unsafe { instance.get_physical_device_queue_family_properties(*pdevice) };
+    //let queue_family_properties =
+    //    unsafe { api.instance.get_physical_device_queue_family_properties(api.pdevice) };
 
-    let queue_family_index = queue_family_properties
-        .iter()
-        .enumerate()
-        .find(|(_, info)| info.queue_flags.contains(vk::QueueFlags::COMPUTE))
-        .map(|(index, _)| index as u32)
-        .expect("No Compute Queue found!");
+    //let queue_family_index = queue_family_properties
+    //    .iter()
+    //    .enumerate()
+    //    .find(|(_, info)| info.queue_flags.contains(vk::QueueFlags::COMPUTE))
+    //    .map(|(index, _)| index as u32)
+    //    .expect("No Compute Queue found!");
 
-    let queue_priorities = [1.0];
-    let queue_create_info = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family_index)
-        .queue_priorities(&queue_priorities);
+    //let queue_priorities = [1.0];
+    //let queue_create_info = vk::DeviceQueueCreateInfo::default()
+    //    .queue_family_index(queue_family_index)
+    //    .queue_priorities(&queue_priorities);
 
-    // --- FP8 GEMM SPECIFIC SETUP START ---
-    let extension_names = get_required_device_extensions();
+    //// --- FP8 GEMM SPECIFIC SETUP START ---
+    //let extension_names = get_required_device_extensions();
 
     // You will also need to chain specific feature structs here (p_next)
     // e.g., vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
     // let mut features13 = vk::PhysicalDeviceVulkan13Features::default().compute_full_subgroups(true);
     // --- FP8 GEMM SPECIFIC SETUP END ---
 
-    let device_create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(std::slice::from_ref(&queue_create_info))
-        .enabled_extension_names(&extension_names);
-    //        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
+    //let device_create_info = vk::DeviceCreateInfo::default()
+    //    .queue_create_infos(std::slice::from_ref(&queue_create_info))
+    //    .enabled_extension_names(&extension_names);
+    ////        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
 
-    // Create logical device
-    let device = unsafe { instance.create_device(*pdevice, &device_create_info, None)? };
-    let command_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-    println!("Vulkan Compute Device Created Successfully!");
+    //// Create logical device
+    //let device = unsafe { api.instance.create_device(api.pdevice, &device_create_info, None)? };
+    //let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+    //println!("Vulkan Compute Device Created Successfully!");
 
+    let device = api.device;
+    let queue = api.queue;
     // Create compute pipeline
     let desc_set_layout = create_descriptor_set_layout(&device);
     let (pipeline, pipeline_layout) = create_compute_pipeline(&device, &desc_set_layout);
@@ -239,7 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_create_info = vk::CommandPoolCreateInfo::default();
 
     let command_pool = unsafe { device.create_command_pool(&pool_create_info, None).unwrap() };
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(*pdevice) };
+    let mem_props = unsafe { api.instance.get_physical_device_memory_properties(api.pdevice) };
     // Input tensor
     let input_shape = [args.in_channels, args.height, args.width];
     let input_data = generate_random_data::<i8>(&input_shape);
@@ -249,7 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &input_data,
         &t_input,
         command_pool,
-        command_queue,
+        queue,
         &mem_props,
     );
 
@@ -262,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &weight_data,
         &t_weight,
         command_pool,
-        command_queue,
+        queue,
         &mem_props,
     );
 
@@ -402,7 +477,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- 4. Submit and Wait ---
         let cmd_buffers = [command_buffer];
         let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-        let queue = command_queue;
         device
             .queue_submit(queue, &[submit_info], vk::Fence::null())
             .unwrap();
@@ -428,7 +502,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.destroy_pipeline(pipeline, None);
         device.destroy_command_pool(command_pool, None);
         device.destroy_device(None);
-        instance.destroy_instance(None);
+        api.instance.destroy_instance(None);
     }
 
     Ok(())
