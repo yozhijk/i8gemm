@@ -14,6 +14,7 @@ mod device_buffer;
 use data::create_tensor;
 
 use crate::data::{copy_host_to_device, generate_random_data};
+use crate::device_buffer::DeviceBuffer;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, disable_help_flag = true)]
@@ -54,7 +55,10 @@ pub struct VulkanApi {
     pub instance: Instance,
     pub pdevice: vk::PhysicalDevice,
     pub device: Device,
-    pub queue: vk::Queue
+    pub queue: vk::Queue,
+    pub command_pool: vk::CommandPool,
+    pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    pub desc_pool: vk::DescriptorPool,
 }
 
 fn get_required_layers() -> Vec<*const i8> {
@@ -90,7 +94,7 @@ fn create_vulkan_api() -> VulkanApi {
     unsafe {
         // Load Vulkan Entry
         // (This loads the Vulkan dynamic library from the system)
-        let entry =  Entry::load().expect("Cannot create Vulkan entry");
+        let entry = Entry::load().expect("Cannot create Vulkan entry");
 
         // Create Instance
         // We request Vulkan 1.3 because of Cooperative Matrix
@@ -104,12 +108,17 @@ fn create_vulkan_api() -> VulkanApi {
             .enabled_extension_names(&layer_extension_names)
             .flags(get_required_instance_flags());
 
-        let instance = entry.create_instance(&instance_create_info, None).expect ("Cannot create Vulkan instance");
+        let instance = entry
+            .create_instance(&instance_create_info, None)
+            .expect("Cannot create Vulkan instance");
 
         // Pick Physical Device (GPU), just pick the first one
-        let pdevices = instance.enumerate_physical_devices().expect("Cannot enumerate physical devices");
+        let pdevices = instance
+            .enumerate_physical_devices()
+            .expect("Cannot enumerate physical devices");
         let pdevice = pdevices.first().expect("No Vulkan physical device found!");
-        let queue_family_properties = instance.get_physical_device_queue_family_properties(*pdevice);
+        let queue_family_properties =
+            instance.get_physical_device_queue_family_properties(*pdevice);
 
         let queue_family_index = queue_family_properties
             .iter()
@@ -137,17 +146,42 @@ fn create_vulkan_api() -> VulkanApi {
         //        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
 
         // Create logical device
-        let device = instance.create_device(*pdevice, &device_create_info, None).expect("Cannot create Vulkan device");
+        let device = instance
+            .create_device(*pdevice, &device_create_info, None)
+            .expect("Cannot create Vulkan device");
         let queue = device.get_device_queue(queue_family_index, 0);
+
+        let pool_create_info =
+            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+        let command_pool = device
+            .create_command_pool(&pool_create_info, None)
+            .expect("Cannot create command pool");
+        let mem_props = instance.get_physical_device_memory_properties(*pdevice);
+
+        // Create descriptor pool for our buffers
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(128)];
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(1);
+
+        let desc_pool = device
+            .create_descriptor_pool(&pool_info, None)
+            .expect("Failed to create descriptor pool");
 
         VulkanApi {
             entry,
             instance,
             pdevice: *pdevice,
             device,
-            queue
+            queue,
+            command_pool,
+            mem_props,
+            desc_pool,
         }
-   }
+    }
 }
 
 fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
@@ -229,141 +263,18 @@ fn create_compute_pipeline(
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Args = Parser::parse();
-
-    println!("Benchmarking with:");
-    println!(
-        "I: {}, O: {}, W: {}, H: {}",
-        args.in_channels, args.out_channels, args.width, args.height
-    );
-    println!("# of iterations: {}", args.tests);
-
-    // RenderDoc
-    // let mut rd: RenderDoc<renderdoc::V141> = RenderDoc::new().expect("Cannot connect to RenderDoc");
-
-    // println!("RenderDoc API Connected!");
-
-    // RenderDoc
-    // rd.start_frame_capture(std::ptr::null(), std::ptr::null());
-
-    // Load Vulkan Entry
-    // (This loads the Vulkan dynamic library from the system)
-    // let entry = unsafe { Entry::load()? };
-
-    // Create Instance
-    // We request Vulkan 1.3 because of Cooperative Matrix
-    // let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
-
-    //let layer_names = get_required_layers();
-    //let layer_extension_names = get_required_instance_extensions();
-    //let instance_create_info = vk::InstanceCreateInfo::default()
-    //    .application_info(&app_info)
-    //    .enabled_layer_names(&layer_names)
-    //    .enabled_extension_names(&layer_extension_names)
-    //    .flags(get_required_instance_flags());
-
-    //let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
-    let api = create_vulkan_api();
-
-    // Pick Physical Device (GPU), just pick the first one
-    // let pdevices = unsafe { api.instance.enumerate_physical_devices()? };
-    // let pdevice = pdevices.first().expect("No Vulkan physical device found!");
-
-    // Find a compute queue family
-    //let queue_family_properties =
-    //    unsafe { api.instance.get_physical_device_queue_family_properties(api.pdevice) };
-
-    //let queue_family_index = queue_family_properties
-    //    .iter()
-    //    .enumerate()
-    //    .find(|(_, info)| info.queue_flags.contains(vk::QueueFlags::COMPUTE))
-    //    .map(|(index, _)| index as u32)
-    //    .expect("No Compute Queue found!");
-
-    //let queue_priorities = [1.0];
-    //let queue_create_info = vk::DeviceQueueCreateInfo::default()
-    //    .queue_family_index(queue_family_index)
-    //    .queue_priorities(&queue_priorities);
-
-    //// --- FP8 GEMM SPECIFIC SETUP START ---
-    //let extension_names = get_required_device_extensions();
-
-    // You will also need to chain specific feature structs here (p_next)
-    // e.g., vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
-    // let mut features13 = vk::PhysicalDeviceVulkan13Features::default().compute_full_subgroups(true);
-    // --- FP8 GEMM SPECIFIC SETUP END ---
-
-    //let device_create_info = vk::DeviceCreateInfo::default()
-    //    .queue_create_infos(std::slice::from_ref(&queue_create_info))
-    //    .enabled_extension_names(&extension_names);
-    ////        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
-
-    //// Create logical device
-    //let device = unsafe { api.instance.create_device(api.pdevice, &device_create_info, None)? };
-    //let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-    //println!("Vulkan Compute Device Created Successfully!");
-
-    let device = api.device;
-    let queue = api.queue;
-    // Create compute pipeline
-    let desc_set_layout = create_descriptor_set_layout(&device);
-    let (pipeline, pipeline_layout) = create_compute_pipeline(&device, &desc_set_layout);
-
-    //  Create device buffers
-    let pool_create_info = vk::CommandPoolCreateInfo::default();
-
-    let command_pool = unsafe { device.create_command_pool(&pool_create_info, None).unwrap() };
-    let mem_props = unsafe { api.instance.get_physical_device_memory_properties(api.pdevice) };
-    // Input tensor
-    let input_shape = [args.in_channels, args.height, args.width];
-    let input_data = generate_random_data::<i8>(&input_shape);
-    let t_input = create_tensor::<i8>(&device, &mem_props, &input_shape);
-    let _ = copy_host_to_device(
-        &device,
-        &input_data,
-        &t_input,
-        command_pool,
-        queue,
-        &mem_props,
-    );
-
-    // Weight tensor
-    let weight_shape = [args.in_channels, args.out_channels, 3, 3];
-    let weight_data = generate_random_data::<i8>(&weight_shape);
-    let t_weight = create_tensor::<i8>(&device, &mem_props, &weight_shape);
-    let _ = copy_host_to_device(
-        &device,
-        &weight_data,
-        &t_weight,
-        command_pool,
-        queue,
-        &mem_props,
-    );
-
-    // Output tensor
-    let output_shape = [args.out_channels, args.height, args.width];
-    let t_output = create_tensor::<i32>(&device, &mem_props, &output_shape);
-
-    // Run compute pass
-    // --- 3. Record Copy Command ---
+fn create_descriptor_set(
+    device: &Device,
+    layout: vk::DescriptorSetLayout,
+    desc_pool: vk::DescriptorPool,
+    t_input: &DeviceBuffer,
+    t_weight: &DeviceBuffer,
+    t_output: &DeviceBuffer,
+) -> vk::DescriptorSet {
     unsafe {
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3)];
-
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&pool_sizes)
-            .max_sets(1);
-
-        let descriptor_pool = device
-            .create_descriptor_pool(&pool_info, None)
-            .expect("Failed to create descriptor pool");
-
-        // --- 2. Allocate the Descriptor Set ---
-        let desc_set_layouts = [desc_set_layout];
+        let desc_set_layouts = [layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
+            .descriptor_pool(desc_pool)
             .set_layouts(&desc_set_layouts);
 
         let descriptor_sets = device
@@ -409,9 +320,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ];
 
         device.update_descriptor_sets(&write_sets, &[]);
+        descriptor_set
+    }
+}
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Args = Parser::parse();
+
+    println!("Benchmarking with:");
+    println!(
+        "I: {}, O: {}, W: {}, H: {}",
+        args.in_channels, args.out_channels, args.width, args.height
+    );
+    println!("# of iterations: {}", args.tests);
+
+    // RenderDoc
+    // let mut rd: RenderDoc<renderdoc::V141> = RenderDoc::new().expect("Cannot connect to RenderDoc");
+    // rd.start_frame_capture(std::ptr::null(), std::ptr::null());
+
+    let api = create_vulkan_api();
+
+    let device = api.device;
+    let queue = api.queue;
+
+    // Create compute pipeline
+    let desc_set_layout = create_descriptor_set_layout(&device);
+    let (pipeline, pipeline_layout) = create_compute_pipeline(&device, &desc_set_layout);
+
+    //  Create device buffers
+    // Input tensor
+    let input_shape = [args.in_channels, args.height, args.width];
+    let input_data = generate_random_data::<i8>(&input_shape);
+    let t_input = create_tensor::<i8>(&device, &api.mem_props, &input_shape);
+    let _ = copy_host_to_device(
+        &device,
+        &input_data,
+        &t_input,
+        api.command_pool,
+        queue,
+        &api.mem_props,
+    );
+
+    // Weight tensor
+    let weight_shape = [args.in_channels, args.out_channels, 3, 3];
+    let weight_data = generate_random_data::<i8>(&weight_shape);
+    let t_weight = create_tensor::<i8>(&device, &api.mem_props, &weight_shape);
+    let _ = copy_host_to_device(
+        &device,
+        &weight_data,
+        &t_weight,
+        api.command_pool,
+        queue,
+        &api.mem_props,
+    );
+
+    // Output tensor
+    let output_shape = [args.out_channels, args.height, args.width];
+    let t_output = create_tensor::<i32>(&device, &api.mem_props, &output_shape);
+
+    // Create descriptor set for our buffers
+    let desc_set = create_descriptor_set(
+        &device,
+        desc_set_layout,
+        api.desc_pool,
+        &t_input,
+        &t_weight,
+        &t_output,
+    );
+
+    // Run compute pass
+    unsafe {
         let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
+            .command_pool(api.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
 
@@ -433,7 +413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vk::PipelineBindPoint::COMPUTE,
             pipeline_layout,
             0, // First set index
-            &[descriptor_set],
+            &[desc_set],
             &[], // Dynamic offsets
         );
 
@@ -481,7 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .queue_submit(queue, &[submit_info], vk::Fence::null())
             .unwrap();
         device.queue_wait_idle(queue).unwrap(); // Wait for copy to finish
-        device.destroy_descriptor_pool(descriptor_pool, None);
+        device.destroy_descriptor_pool(api.desc_pool, None);
     }
 
     // Download data
@@ -500,7 +480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.destroy_descriptor_set_layout(desc_set_layout, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_pipeline(pipeline, None);
-        device.destroy_command_pool(command_pool, None);
+        device.destroy_command_pool(api.command_pool, None);
         device.destroy_device(None);
         api.instance.destroy_instance(None);
     }
