@@ -231,3 +231,37 @@ pub fn array_exact_compare<T: PartialEq + Display>(
         true
     }
 }
+
+pub fn reorder_weights_nchw<T: Copy>(
+    ic: usize,
+    oc: usize,
+    ic_slice: usize,
+    oc_slice: usize,
+    weights: &[T],
+    reordered: &mut [T],
+) {
+    // Original format strides
+    let oc_stride = ic * 9;
+
+    // Sliced formate strides
+    let num_input_slices = ic / ic_slice;
+    let num_output_slices = oc / oc_slice;
+    let matrix_size = ic_slice * oc_slice;
+    let input_slice_stride = matrix_size * 9;
+    let output_slice_stride = input_slice_stride * num_input_slices;
+
+    for output_slice in 0..num_output_slices {
+        for input_slice in 0..num_input_slices {
+            for k in 0..9 {
+                for elem in 0..matrix_size {
+                    let ich = input_slice * ic_slice + elem / oc_slice;
+                    let och = output_slice * oc_slice + elem % oc_slice;
+                    reordered[output_slice * output_slice_stride
+                        + input_slice * input_slice_stride
+                        + k * matrix_size
+                        + elem] = weights[och * oc_stride + ich * 9 + k];
+                }
+            }
+        }
+    }
+}

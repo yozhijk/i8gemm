@@ -15,6 +15,7 @@ use data::{array_exact_compare, create_tensor};
 
 use crate::data::{
     conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, generate_random_data,
+    reorder_weights_nchw,
 };
 use crate::device_buffer::DeviceBuffer;
 
@@ -439,6 +440,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         api.command_pool,
         queue,
         &api.mem_props,
+    );
+
+    let mut weight_reordered_data = vec![0_i8; weight_data.len()];
+    reorder_weights_nchw(
+        args.in_channels,
+        args.out_channels,
+        16,
+        16,
+        &weight_data,
+        &mut weight_reordered_data,
     );
 
     // Output tensor
