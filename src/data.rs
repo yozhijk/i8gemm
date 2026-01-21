@@ -1,6 +1,7 @@
 use ash::{Device, vk};
 use rand::distributions::{Distribution, Standard};
 use rand::{self, Rng};
+use std::fmt::Display;
 use std::ptr;
 
 use super::device_buffer::DeviceBuffer;
@@ -163,4 +164,70 @@ where
 
     let data: Vec<T> = (0..count).map(|_| rng.r#gen()).collect();
     data
+}
+
+pub fn conv3x3_i8_acc_i32(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    input_data: &[i8],
+    weight_data: &[i8],
+    output_data: &mut [i32],
+) {
+    let (ic, h, w) = (
+        input_shape[0] as isize,
+        input_shape[1] as isize,
+        input_shape[2] as isize,
+    );
+    let oc = output_shape[0] as isize;
+
+    let get_input_value = |i: isize, y: isize, x: isize| -> i8 {
+        if x < 0 || x >= w || y < 0 || y >= h {
+            0_i8
+        } else {
+            input_data[(i * w * h + y * w + x) as usize]
+        }
+    };
+
+    let get_weight_value = |o: isize, i: isize, dy: isize, dx: isize| -> i8 {
+        let y = dy + 1;
+        let x = dx + 1;
+        weight_data[(o * ic * 3 * 3 + i * 3 * 3 + y * 3 + x) as usize]
+    };
+
+    for y in 0_isize..h {
+        for x in 0_isize..w {
+            for o in 0_isize..oc {
+                let mut res = 0_i32;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for i in 0..ic {
+                            res += get_input_value(i, y + dy, x + dx) as i32
+                                * get_weight_value(o, i, dy, dx) as i32;
+                        }
+                    }
+                }
+                output_data[(o * h * w + y * w + x) as usize] = res;
+            }
+        }
+    }
+}
+
+pub fn array_exact_compare<T: PartialEq + Display>(
+    a: &[T],
+    b: &[T],
+    a_label: &str,
+    b_label: &str,
+) -> bool {
+    let mismatch_idx = a.iter().zip(b).position(|(a, b)| a != b);
+
+    if let Some(idx) = mismatch_idx {
+        println!(
+            "Mismatch at index {}: {}={} vs {}={}",
+            idx, a_label, a[idx], b_label, b[idx]
+        );
+        false
+    } else {
+        println!("Arrays match perfectly!");
+        true
+    }
 }

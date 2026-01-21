@@ -24,15 +24,15 @@ const int OC_SLICE = 16;
 
 // --- Buffers ---
 layout(set = 0, binding = 0) readonly buffer Input {
-    uint t_input[]; 
+    int8_t t_input[]; 
 };
 
 layout(set = 0, binding = 1) readonly buffer Weight {
-    uint t_weight[];
+    int8_t t_weight[];
 };
 
 layout(set = 0, binding = 2) buffer Output {
-    uint t_output[];
+    int t_output[];
 };
 
 // Push Constants for dynamic dimensions
@@ -44,7 +44,7 @@ layout(push_constant) uniform PushConsts {
     uint pad[4];
 } p;
 
-uint get_input_elem(uint ic, uint y, uint x) {
+int get_input_elem(int ic, int y, int x) {
     if (y < 0 || y >= p.height || x < 0 || x >= p.width)
     {
         return 0;
@@ -52,18 +52,19 @@ uint get_input_elem(uint ic, uint y, uint x) {
 
     return t_input[ic * p.height * p.width + y * p.width + x];
 }
-uint store_output_elem(uint oc, uint y, uint x, uint val) {
+
+void store_output_elem(int oc, int y, int x, int val) {
     if (y < 0 || y >= p.height || x < 0 || x >= p.width)
     {
-        return 0;
+        return;
     }
 
     t_output[oc * p.height * p.width + y * p.width + x] = val;
 }
 
-uint get_weight_3x3(uint oc, uint ic, uint dy, uint dx) {
-    uint y = dy + 1;
-    uint x = dx + 1;
+int get_weight_3x3(int oc, int ic, int dy, int dx) {
+    int y = dy + 1;
+    int x = dx + 1;
     return t_weight[oc * p.num_ic * 3 * 3 + ic * 3 * 3 + y * 3 + x];
 }
 
@@ -118,12 +119,12 @@ void main() {
 //    // 5. Store Result
 //    uint idxC = globalRow * p.N + globalCol;
 //    coopMatStore(matC, dataC, idxC, p.N, gl_CooperativeMatrixLayoutRowMajor);
-    uint out_x = gl_GlobalInvocationID.x;
-    uint out_y = gl_GlobalInvocationID.y;
+    int out_x = int(gl_GlobalInvocationID.x);
+    int out_y = int(gl_GlobalInvocationID.y);
 
     if (out_x < p.width && out_y < p.height) {
         for (int oc = 0; oc < p.num_oc; ++oc) {
-            uint res = 0;
+            int res = 0;
             for (int ic = 0; ic < p.num_ic; ++ic) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     for (int dy = -1; dy <= 1; ++dy){

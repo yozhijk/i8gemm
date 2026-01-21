@@ -11,9 +11,11 @@ use std::io::Cursor;
 mod data;
 mod device_buffer;
 
-use data::create_tensor;
+use data::{array_exact_compare, create_tensor};
 
-use crate::data::{copy_host_to_device, generate_random_data};
+use crate::data::{
+    conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, generate_random_data,
+};
 use crate::device_buffer::DeviceBuffer;
 
 #[derive(Parser, Debug)]
@@ -197,6 +199,15 @@ fn create_vulkan_api() -> VulkanApi {
             query_pool,
             props,
         }
+    }
+}
+
+fn destroy_vulkan_api(api: VulkanApi) {
+    unsafe {
+        api.device.destroy_query_pool(api.query_pool, None);
+        api.device.destroy_command_pool(api.command_pool, None);
+        api.device.destroy_device(None);
+        api.instance.destroy_instance(None);
     }
 }
 
@@ -394,20 +405,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let api = create_vulkan_api();
 
-    let device = api.device;
+    let device = &api.device;
     let queue = api.queue;
 
     // Create compute pipeline
-    let desc_set_layout = create_descriptor_set_layout(&device);
-    let (pipeline, pipeline_layout) = create_compute_pipeline(&device, &desc_set_layout);
+    let desc_set_layout = create_descriptor_set_layout(device);
+    let (pipeline, pipeline_layout) = create_compute_pipeline(device, &desc_set_layout);
 
     //  Create device buffers
     // Input tensor
     let input_shape = [args.in_channels, args.height, args.width];
     let input_data = generate_random_data::<i8>(&input_shape);
-    let t_input = create_tensor::<i8>(&device, &api.mem_props, &input_shape);
+    // let input_data = vec![1_i8; args.in_channels * args.height * args.width];
+    let t_input = create_tensor::<i8>(device, &api.mem_props, &input_shape);
     let _ = copy_host_to_device(
-        &device,
+        device,
         &input_data,
         &t_input,
         api.command_pool,
@@ -418,9 +430,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Weight tensor
     let weight_shape = [args.in_channels, args.out_channels, 3, 3];
     let weight_data = generate_random_data::<i8>(&weight_shape);
-    let t_weight = create_tensor::<i8>(&device, &api.mem_props, &weight_shape);
+    // let weight_data = vec![1_i8; args.in_channels * args.out_channels * 9];
+    let t_weight = create_tensor::<i8>(device, &api.mem_props, &weight_shape);
     let _ = copy_host_to_device(
-        &device,
+        device,
         &weight_data,
         &t_weight,
         api.command_pool,
@@ -430,11 +443,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Output tensor
     let output_shape = [args.out_channels, args.height, args.width];
-    let t_output = create_tensor::<i32>(&device, &api.mem_props, &output_shape);
+    let t_output = create_tensor::<i32>(device, &api.mem_props, &output_shape);
 
     // Create descriptor set for our buffers
     let desc_set = create_descriptor_set(
-        &device,
+        device,
         desc_set_layout,
         api.desc_pool,
         &t_input,
@@ -532,34 +545,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.queue_wait_idle(queue).unwrap(); // Wait for copy to finish
 
         let gpu_time =
-            get_execution_time_ns(&device, api.query_pool, api.props.limits.timestamp_period);
+            get_execution_time_ns(device, api.query_pool, api.props.limits.timestamp_period);
 
         println!("Dispatch took: {:.3} ms", gpu_time / 1e6);
 
         device.destroy_descriptor_pool(api.desc_pool, None);
     }
 
+    let num_output_elements = args.width * args.height * args.out_channels;
+    let mut gpu_output = vec![0; num_output_elements];
     // Download data
+    let _ = copy_device_to_host(
+        device,
+        &t_output,
+        &mut gpu_output,
+        api.command_pool,
+        queue,
+        &api.mem_props,
+    );
 
     // Compare to golden
+    let mut host_output = vec![0_i32; args.out_channels * args.height * args.width];
+    conv3x3_i8_acc_i32(
+        &input_shape,
+        &output_shape,
+        &input_data,
+        &weight_data,
+        &mut host_output,
+    );
+
+    let _ = array_exact_compare(&host_output, &gpu_output, "CPU", "GPU");
+
+    // Print first 10 elements
+    // println!("Some elements: {:?}", &host_output[1536..1536 + 10]);
+    // println!("CPU elements: {:?}", &host_output);
+    // println!("GPU elements: {:?}", &gpu_output);
 
     // RenderDoc
     // rd.end_frame_capture(std::ptr::null(), std::ptr::null());
 
-    // 7. Cleanup;
     unsafe {
-        t_input.destroy(&device);
-        t_output.destroy(&device);
-        t_weight.destroy(&device);
+        t_input.destroy(device);
+        t_output.destroy(device);
+        t_weight.destroy(device);
 
-        device.destroy_query_pool(api.query_pool, None);
         device.destroy_descriptor_set_layout(desc_set_layout, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_pipeline(pipeline, None);
-        device.destroy_command_pool(api.command_pool, None);
-        device.destroy_device(None);
-        api.instance.destroy_instance(None);
     }
 
+    destroy_vulkan_api(api);
     Ok(())
 }
