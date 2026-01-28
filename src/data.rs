@@ -184,7 +184,7 @@ pub fn conv3x3_i8_acc_i32(
         if x < 0 || x >= w || y < 0 || y >= h {
             0_i8
         } else {
-            input_data[(i * w * h + y * w + x) as usize]
+            input_data[(y * w * ic + x * ic + i) as usize]
         }
     };
 
@@ -206,7 +206,8 @@ pub fn conv3x3_i8_acc_i32(
                         }
                     }
                 }
-                output_data[(o * h * w + y * w + x) as usize] = res;
+                // output_data[(o * h * w + y * w + x) as usize] = res;
+                output_data[(y * w * oc + x * oc + o) as usize] = res;
             }
         }
     }

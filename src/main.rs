@@ -95,6 +95,31 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
     }
 }
 
+fn get_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk::PhysicalDevice) {
+    unsafe {
+        // 1. Load the Extension Helper
+        let coop_mat_fn = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+
+        // 2. Query Properties
+        let props = coop_mat_fn
+            .get_physical_device_cooperative_matrix_properties(pdevice)
+            .expect("Failed to query cooperative matrix properties");
+
+        // 3. Find your specific configuration
+        for p in props {
+            if p.a_type == vk::ComponentTypeKHR::SINT8
+                && p.c_type == vk::ComponentTypeKHR::SINT32
+                && p.scope == vk::ScopeKHR::SUBGROUP
+            {
+                println!(
+                    "Supported: M={} N={} K={} (A: {:?}, C: {:?})",
+                    p.m_size, p.n_size, p.k_size, p.a_type, p.c_type
+                );
+            }
+        }
+    }
+}
+
 fn create_vulkan_api() -> VulkanApi {
     unsafe {
         // Load Vulkan Entry
@@ -155,6 +180,9 @@ fn create_vulkan_api() -> VulkanApi {
             .create_device(*pdevice, &device_create_info, None)
             .expect("Cannot create Vulkan device");
         let queue = device.get_device_queue(queue_family_index, 0);
+
+        // Get supported matrix sizes
+        get_supported_matrix_sizes(&entry, &instance, *pdevice);
 
         let pool_create_info =
             vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
@@ -254,7 +282,7 @@ fn create_compute_pipeline(
     unsafe {
         // Load SPIRV
         // Note: This path is relative to the file where this macro is called (src/main.rs)
-        let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.comp.spv"));
+        let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.coopmat.comp.spv"));
         let shader_code = read_spv(&mut Cursor::new(shader_bytes)).unwrap();
 
         // Create shader module
@@ -390,6 +418,46 @@ pub fn get_execution_time_ns(
     }
 }
 
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+
+fn dump_tensor_to_csv(data: &[i32], width: usize, channels: usize, path: &str) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write Header: row, col, ch0, ch1, ...
+    write!(writer, "row,col")?;
+    for c in 0..channels {
+        write!(writer, ",ch{}", c)?;
+    }
+    writeln!(writer)?;
+
+    // stride = width * channels
+    let row_stride = width * channels;
+
+    // Iterate over rows
+    // Note: This logic assumes your data is perfect size. Add checks if needed.
+    let num_rows = data.len() / row_stride;
+
+    for r in 0..num_rows {
+        for c in 0..width {
+            // Start of this pixel
+            let pixel_idx = (r * row_stride) + (c * channels);
+
+            write!(writer, "{},{}", r, c)?;
+
+            // Write all channels for this pixel on one line
+            for ch in 0..channels {
+                write!(writer, ",{}", data[pixel_idx + ch])?;
+            }
+            writeln!(writer)?;
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = Parser::parse();
 
@@ -416,8 +484,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  Create device buffers
     // Input tensor
     let input_shape = [args.in_channels, args.height, args.width];
-    let input_data = generate_random_data::<i8>(&input_shape);
-    // let input_data = vec![1_i8; args.in_channels * args.height * args.width];
+    //let input_data = generate_random_data::<i8>(&input_shape);
+    let input_data = vec![1_i8; args.in_channels * args.height * args.width];
     let t_input = create_tensor::<i8>(device, &api.mem_props, &input_shape);
     let _ = copy_host_to_device(
         device,
@@ -432,24 +500,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weight_shape = [args.in_channels, args.out_channels, 3, 3];
     let weight_data = generate_random_data::<i8>(&weight_shape);
     // let weight_data = vec![1_i8; args.in_channels * args.out_channels * 9];
-    let t_weight = create_tensor::<i8>(device, &api.mem_props, &weight_shape);
-    let _ = copy_host_to_device(
-        device,
-        &weight_data,
-        &t_weight,
-        api.command_pool,
-        queue,
-        &api.mem_props,
-    );
-
     let mut weight_reordered_data = vec![0_i8; weight_data.len()];
     reorder_weights_nchw(
         args.in_channels,
         args.out_channels,
-        16,
+        32,
         16,
         &weight_data,
         &mut weight_reordered_data,
+    );
+
+    let t_weight = create_tensor::<i8>(device, &api.mem_props, &weight_shape);
+    let _ = copy_host_to_device(
+        device,
+        &weight_reordered_data,
+        &t_weight,
+        api.command_pool,
+        queue,
+        &api.mem_props,
     );
 
     // Output tensor
@@ -526,9 +594,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Calculate Dispatch Dimensions
         // CAUTION: This depends entirely on your shader's local_size_x/y
-        let workgroup_size = 8;
-        let group_count_x = args.width.div_ceil(workgroup_size);
-        let group_count_y = args.height.div_ceil(workgroup_size);
+        let tile_size = (8, 4);
+        let group_count_x = args.width.div_ceil(tile_size.0);
+        let group_count_y = args.height.div_ceil(tile_size.1);
 
         // Dispatch
         device.cmd_dispatch(
@@ -588,9 +656,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = array_exact_compare(&host_output, &gpu_output, "CPU", "GPU");
 
     // Print first 10 elements
-    // println!("Some elements: {:?}", &host_output[1536..1536 + 10]);
-    // println!("CPU elements: {:?}", &host_output);
-    // println!("GPU elements: {:?}", &gpu_output);
+    //println!("Some elements CPU: {:?}", &host_output[0..64]);
+    //println!("Some elements GPU: {:?}", &gpu_output[0..64]);
+    //println!("CPU elements: {:?}", &host_output);
+    //println!("GPU elements: {:?}", &gpu_output);
+    //println!("Some elements GPU: {:?}", &gpu_output[0..]);
+    // dump_tensor_to_csv(&gpu_output, args.width, args.out_channels, "gpu_out.csv");
+    // dump_tensor_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv");
 
     // RenderDoc
     // rd.end_frame_capture(std::ptr::null(), std::ptr::null());
