@@ -14,8 +14,8 @@ mod device_buffer;
 use data::{array_exact_compare, create_tensor};
 
 use crate::data::{
-    conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, generate_random_data,
-    reorder_weights_nchw,
+    conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, dump_hwc_to_csv,
+    generate_random_data, reorder_weights_nchw,
 };
 use crate::device_buffer::DeviceBuffer;
 
@@ -82,8 +82,10 @@ fn get_required_device_extensions() -> Vec<*const i8> {
     if cfg!(target_os = "macos") {
         vec![c"VK_KHR_portability_subset".as_ptr()]
     } else {
-        //vec![c"VK_KHR_cooperative_matrix".as_ptr()]
-        vec![]
+        vec![
+            c"VK_KHR_cooperative_matrix".as_ptr(),
+            c"VK_KHR_workgroup_memory_explicit_layout".as_ptr(),
+        ]
     }
 }
 
@@ -95,7 +97,7 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
     }
 }
 
-fn get_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk::PhysicalDevice) {
+fn print_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk::PhysicalDevice) {
     unsafe {
         // 1. Load the Extension Helper
         let coop_mat_fn = ash::khr::cooperative_matrix::Instance::new(entry, instance);
@@ -165,15 +167,31 @@ fn create_vulkan_api() -> VulkanApi {
         // --- FP8 GEMM SPECIFIC SETUP START ---
         let extension_names = get_required_device_extensions();
 
-        // You will also need to chain specific feature structs here (p_next)
-        // e.g., vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
-        // let mut features13 = vk::PhysicalDeviceVulkan13Features::default().compute_full_subgroups(true);
-        // --- FP8 GEMM SPECIFIC SETUP END ---
+        // 1. Vulkan 1.2 Features (Required for VulkanMemoryModel)
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .vulkan_memory_model(true) // Fixes Error 2
+            .shader_float16(true) // Likely needed for tensor ops
+            .shader_int8(true)
+            .uniform_and_storage_buffer8_bit_access(true)
+            .storage_buffer8_bit_access(true);
+        let mut coop_matrix_features =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut workgroup_layout_features =
+            vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
+                .workgroup_memory_explicit_layout(true)
+                .workgroup_memory_explicit_layout8_bit_access(true)
+                .workgroup_memory_explicit_layout_scalar_block_layout(true);
+
+        let mut shader_float16_int8_features =
+            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_int8(true);
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info))
-            .enabled_extension_names(&extension_names);
-        //        .push_next(&mut features13); // Example of enabling Vulkan 1.3 features
+            .enabled_extension_names(&extension_names)
+            .push_next(&mut features12)
+            .push_next(&mut workgroup_layout_features)
+            .push_next(&mut shader_float16_int8_features)
+            .push_next(&mut coop_matrix_features);
 
         // Create logical device
         let device = instance
@@ -182,7 +200,7 @@ fn create_vulkan_api() -> VulkanApi {
         let queue = device.get_device_queue(queue_family_index, 0);
 
         // Get supported matrix sizes
-        get_supported_matrix_sizes(&entry, &instance, *pdevice);
+        print_supported_matrix_sizes(&entry, &instance, *pdevice);
 
         let pool_create_info =
             vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
@@ -416,46 +434,6 @@ pub fn get_execution_time_ns(
             }
         }
     }
-}
-
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
-
-fn dump_tensor_to_csv(data: &[i32], width: usize, channels: usize, path: &str) -> io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-
-    // Write Header: row, col, ch0, ch1, ...
-    write!(writer, "row,col")?;
-    for c in 0..channels {
-        write!(writer, ",ch{}", c)?;
-    }
-    writeln!(writer)?;
-
-    // stride = width * channels
-    let row_stride = width * channels;
-
-    // Iterate over rows
-    // Note: This logic assumes your data is perfect size. Add checks if needed.
-    let num_rows = data.len() / row_stride;
-
-    for r in 0..num_rows {
-        for c in 0..width {
-            // Start of this pixel
-            let pixel_idx = (r * row_stride) + (c * channels);
-
-            write!(writer, "{},{}", r, c)?;
-
-            // Write all channels for this pixel on one line
-            for ch in 0..channels {
-                write!(writer, ",{}", data[pixel_idx + ch])?;
-            }
-            writeln!(writer)?;
-        }
-    }
-
-    writer.flush()?;
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

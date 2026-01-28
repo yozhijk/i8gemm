@@ -2,6 +2,8 @@ use ash::{Device, vk};
 use rand::distributions::{Distribution, Standard};
 use rand::{self, Rng};
 use std::fmt::Display;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::ptr;
 
 use super::device_buffer::DeviceBuffer;
@@ -265,4 +267,41 @@ pub fn reorder_weights_nchw<T: Copy>(
             }
         }
     }
+}
+
+pub fn dump_hwc_to_csv(data: &[i32], width: usize, channels: usize, path: &str) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write Header: row, col, ch0, ch1, ...
+    write!(writer, "row,col")?;
+    for c in 0..channels {
+        write!(writer, ",ch{}", c)?;
+    }
+    writeln!(writer)?;
+
+    // stride = width * channels
+    let row_stride = width * channels;
+
+    // Iterate over rows
+    // Note: This logic assumes your data is perfect size. Add checks if needed.
+    let num_rows = data.len() / row_stride;
+
+    for r in 0..num_rows {
+        for c in 0..width {
+            // Start of this pixel
+            let pixel_idx = (r * row_stride) + (c * channels);
+
+            write!(writer, "{},{}", r, c)?;
+
+            // Write all channels for this pixel on one line
+            for ch in 0..channels {
+                write!(writer, ",{}", data[pixel_idx + ch])?;
+            }
+            writeln!(writer)?;
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
 }
