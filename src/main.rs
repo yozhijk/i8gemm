@@ -5,7 +5,7 @@ use ash::{
     vk::{self},
 };
 use clap::Parser;
-//use renderdoc::RenderDoc;
+// use renderdoc::RenderDoc;
 use std::io::Cursor;
 
 mod data;
@@ -15,8 +15,7 @@ use data::{array_exact_compare, create_tensor};
 
 use crate::data::{
     conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, dump_hwc_to_csv,
-    generate_copy_conv3x3_weights, generate_copy1ch_conv3x3_weights, generate_random_data,
-    generate_row_number, reorder_weights_nchw,
+    generate_random_data, reorder_weights_nchw,
 };
 use crate::device_buffer::DeviceBuffer;
 
@@ -65,6 +64,7 @@ pub struct VulkanApi {
     pub desc_pool: vk::DescriptorPool,
     pub query_pool: vk::QueryPool,
     pub props: vk::PhysicalDeviceProperties,
+    pub queue_props: vk::QueueFamilyProperties,
 }
 
 fn get_required_layers() -> Vec<*const i8> {
@@ -124,7 +124,7 @@ fn print_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk:
     }
 }
 
-fn create_vulkan_api() -> VulkanApi {
+fn create_vulkan_api(num_queries: u32) -> VulkanApi {
     unsafe {
         // Load Vulkan Entry
         // (This loads the Vulkan dynamic library from the system)
@@ -175,7 +175,8 @@ fn create_vulkan_api() -> VulkanApi {
             .shader_float16(true) // Likely needed for tensor ops
             .shader_int8(true)
             .uniform_and_storage_buffer8_bit_access(true)
-            .storage_buffer8_bit_access(true);
+            .storage_buffer8_bit_access(true)
+            .host_query_reset(true);
         let mut coop_matrix_features =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut workgroup_layout_features =
@@ -221,13 +222,11 @@ fn create_vulkan_api() -> VulkanApi {
             .create_descriptor_pool(&pool_info, None)
             .expect("Failed to create descriptor pool");
 
-        // 1. Get Timestamp Period (ns per tick)
         let props = instance.get_physical_device_properties(*pdevice);
 
-        // 2. Create Query Pool for 2 timestamps (Start & End)
         let create_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(2); // Index 0 = Start, Index 1 = End
+            .query_count(2 * num_queries);
 
         let query_pool = device
             .create_query_pool(&create_info, None)
@@ -244,6 +243,7 @@ fn create_vulkan_api() -> VulkanApi {
             desc_pool,
             query_pool,
             props,
+            queue_props: queue_family_properties[queue_family_index as usize],
         }
     }
 }
@@ -320,9 +320,6 @@ fn create_compute_pipeline(
         let pipeline_layout = device
             .create_pipeline_layout(&pipeline_layout_info, None)
             .expect("Cannot create pipeline layout");
-        let mut pipeline_shader_stage_required_subgroup_size =
-            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(32);
         let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
@@ -402,8 +399,10 @@ fn create_descriptor_set(
 
 pub fn get_execution_time_ns(
     device: &Device,
+    index: usize,
     query_pool: vk::QueryPool,
     timestamp_period: f32,
+    valid_bits: u32,
 ) -> f64 {
     unsafe {
         // Array to hold the two 64-bit timestamps
@@ -414,7 +413,7 @@ pub fn get_execution_time_ns(
         // flag VK_QUERY_RESULT_WAIT ensures we don't return until data is ready
         let result = device.get_query_pool_results(
             query_pool,
-            0,
+            index as u32 * 2,
             &mut timestamps, // Output buffer
             vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
         );
@@ -424,10 +423,16 @@ pub fn get_execution_time_ns(
                 let start = timestamps[0];
                 let end = timestamps[1];
 
-                // Calculate delta ticks
-                let delta_ticks = end.wrapping_sub(start);
+                // Calculate valid mask
+                let mask = if valid_bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << valid_bits) - 1
+                };
 
-                // Convert to nanoseconds
+                // Apply mask before subtraction
+                let delta_ticks = (end & mask).wrapping_sub(start & mask) & mask;
+
                 (delta_ticks as f64) * (timestamp_period as f64)
             }
             Err(e) => {
@@ -436,6 +441,42 @@ pub fn get_execution_time_ns(
             }
         }
     }
+}
+
+fn check_input_sizes(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.in_channels & 31 != 0 {
+        return Err(format!(
+            "ERROR: in_channels should be multiple of 32, but given {}",
+            args.in_channels
+        )
+        .into());
+    }
+
+    if args.out_channels & 15 != 0 {
+        return Err(format!(
+            "ERROR: out_channels should be multiple of 16, but given {}",
+            args.out_channels
+        )
+        .into());
+    }
+
+    if args.width & 15 != 0 {
+        return Err(format!(
+            "ERROR: width should be multiple of 16, but given {}",
+            args.width
+        )
+        .into());
+    }
+
+    if args.height & 15 != 0 {
+        return Err(format!(
+            "ERROR: height should be multiple of 16, but given {}",
+            args.height
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -448,11 +489,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("# of iterations: {}", args.tests);
 
+    check_input_sizes(&args)?;
+
     // RenderDoc
     // let mut rd: RenderDoc<renderdoc::V141> = RenderDoc::new().expect("Cannot connect to RenderDoc");
     // rd.start_frame_capture(std::ptr::null(), std::ptr::null());
 
-    let api = create_vulkan_api();
+    let api = create_vulkan_api(args.tests as u32);
 
     let device = &api.device;
     let queue = api.queue;
@@ -477,7 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &api.mem_props,
     );
 
-    // Weight tensor
+    // Weight TILE_SIZE
     let weight_shape = [args.in_channels, args.out_channels, 3, 3];
     let weight_data = generate_random_data::<i8>(&weight_shape);
     // let weight_data = generate_copy_conv3x3_weights::<i8>(weight_shape[0]);
@@ -518,97 +561,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run compute pass
     unsafe {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(api.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+        for t in 0..args.tests {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(api.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
 
-        let command_buffer = device.allocate_command_buffers(&allocate_info).unwrap()[0];
+            if t == 0 {
+                device.reset_query_pool(api.query_pool, 0, 2 * args.tests as u32);
+            }
 
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let command_buffer = device.allocate_command_buffers(&allocate_info).unwrap()[0];
 
-        device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .unwrap();
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-        // Bind Pipeline
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .unwrap();
 
-        // Bind Descriptors
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            0, // First set index
-            &[desc_set],
-            &[], // Dynamic offsets
-        );
+            // Bind Pipeline
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
 
-        let constants = PushConstants {
-            num_ic: args.in_channels as u32,
-            num_oc: args.out_channels as u32,
-            height: args.height as u32,
-            width: args.width as u32,
-            pad: [42, 11, 5, 16],
-        };
+            // Bind Descriptors
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout,
+                0, // First set index
+                &[desc_set],
+                &[], // Dynamic offsets
+            );
 
-        // "Serialize" struct to bytes (unsafe cast)
-        let constants_ptr = &constants as *const PushConstants as *const u8;
-        let constants_bytes =
-            std::slice::from_raw_parts(constants_ptr, std::mem::size_of::<PushConstants>());
+            let constants = PushConstants {
+                num_ic: args.in_channels as u32,
+                num_oc: args.out_channels as u32,
+                height: args.height as u32,
+                width: args.width as u32,
+                pad: [42, 11, 5, 16],
+            };
 
-        device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0, // offset
-            constants_bytes,
-        );
+            // "Serialize" struct to bytes (unsafe cast)
+            let constants_ptr = &constants as *const PushConstants as *const u8;
+            let constants_bytes =
+                std::slice::from_raw_parts(constants_ptr, std::mem::size_of::<PushConstants>());
 
-        device.cmd_reset_query_pool(command_buffer, api.query_pool, 0, 2);
-        device.cmd_write_timestamp(
-            command_buffer,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            api.query_pool,
-            0,
-        );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0, // offset
+                constants_bytes,
+            );
 
-        // Calculate Dispatch Dimensions
-        // CAUTION: This depends entirely on your shader's local_size_x/y
-        let tile_size = (8, 4);
-        let group_count_x = args.width.div_ceil(tile_size.0);
-        let group_count_y = args.height.div_ceil(tile_size.1);
+            device.cmd_write_timestamp(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                api.query_pool,
+                2 * t as u32,
+            );
 
-        // Dispatch
-        device.cmd_dispatch(
-            command_buffer,
-            group_count_x as u32,
-            group_count_y as u32,
-            1,
-        );
+            // Calculate Dispatch Dimensions
+            // CAUTION: This depends entirely on your shader's local_size_x/y
+            let tile_size = (8, 4);
+            let group_count_x = args.width.div_ceil(tile_size.0);
+            let group_count_y = args.height.div_ceil(tile_size.1);
 
-        device.cmd_write_timestamp(
-            command_buffer,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            api.query_pool,
-            1,
-        );
+            // Dispatch
+            device.cmd_dispatch(
+                command_buffer,
+                group_count_x as u32,
+                group_count_y as u32,
+                1,
+            );
 
-        device.end_command_buffer(command_buffer).unwrap();
+            device.cmd_write_timestamp(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                api.query_pool,
+                2 * t as u32 + 1,
+            );
 
-        // --- 4. Submit and Wait ---
-        let cmd_buffers = [command_buffer];
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-        device
-            .queue_submit(queue, &[submit_info], vk::Fence::null())
-            .unwrap();
+            device.end_command_buffer(command_buffer).unwrap();
+
+            // --- 4. Submit and Wait ---
+            let cmd_buffers = [command_buffer];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+            device
+                .queue_submit(queue, &[submit_info], vk::Fence::null())
+                .unwrap();
+        }
+
         device.queue_wait_idle(queue).unwrap(); // Wait for copy to finish
 
-        let gpu_time =
-            get_execution_time_ns(device, api.query_pool, api.props.limits.timestamp_period);
+        let mut total_exec_time = 0.0;
 
-        println!("Dispatch took: {:.3} ms", gpu_time / 1e6);
+        for t in 0..args.tests {
+            total_exec_time += get_execution_time_ns(
+                device,
+                t,
+                api.query_pool,
+                api.props.limits.timestamp_period,
+                api.queue_props.timestamp_valid_bits,
+            );
+        }
+
+        total_exec_time /= args.tests as f64;
+
+        println!("Dispatch took: {:.3} ms", total_exec_time / 1e6);
+
+        let ops = args.in_channels * args.out_channels * 9 * args.width * args.height * 2;
+
+        println!(
+            "Achieved INT8 throughput: {} tops/s",
+            ops as f64 / (total_exec_time * 1e3)
+        )
     }
 
     let num_output_elements = args.width * args.height * args.out_channels;
@@ -641,10 +708,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //println!("CPU elements: {:?}", &host_output);
     //println!("GPU elements: {:?}", &gpu_output);
     //println!("Some elements GPU: {:?}", &gpu_output[0..]);
-    dump_hwc_to_csv(&gpu_output, args.width, args.out_channels, "gpu_out.csv");
-    dump_hwc_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv");
-    dump_hwc_to_csv(&input_data, args.width, args.out_channels, "gpu_in.csv");
-    // dump_tensor_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv");
+    // dump_hwc_to_csv(&gpu_output, args.width, args.out_channels, "gpu_out.csv")?;
+    // dump_hwc_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv")?;
+    // dump_hwc_to_csv(&input_data, args.width, args.out_channels, "gpu_in.csv")?;
 
     // RenderDoc
     // rd.end_frame_capture(std::ptr::null(), std::ptr::null());
