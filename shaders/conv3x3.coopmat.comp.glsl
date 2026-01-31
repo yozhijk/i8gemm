@@ -151,6 +151,7 @@ void main() {
                 // 5. Perform MMA and accumulate to mat_c[r]
                 mat_c = coopMatMulAdd(mat_a, mat_b, mat_c);
             }
+            barrier();
         }
 
         // Store output slice
