@@ -3,8 +3,8 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_memory_scope_semantics: require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8: require
+#extension GL_EXT_shader_8bit_storage: require
 #extension GL_EXT_shared_memory_block: require
 
 // NOTE: Depending on your glslang version, you might need this for explicit float8 types.
@@ -36,12 +36,7 @@ const int OC_SLICE_IN_IVEC4 = OC_SLICE / SIZE_OF_IVEC4;
 const int INPUT_TILE_SIZE_IN_BYTES = TILE_SIZE_WITH_RING * IC_SLICE;
 const int INPUT_TILE_SIZE_IN_IVEC4 = INPUT_TILE_SIZE_IN_BYTES / SIZE_OF_IVEC4;
 
-shared Memory
-{
-    layout(offset=0) int8_t shared_tile_i8[INPUT_TILE_SIZE_IN_BYTES];
-    layout(offset=0, align=16) ivec4 shared_tile_ivec4[INPUT_TILE_SIZE_IN_IVEC4];
-} shmem;
-
+shared ivec4 shared_tile_ivec4[INPUT_TILE_SIZE_IN_IVEC4];
 
 layout(local_size_x = WORKGROUP_SIZE_X, local_size_y = WORKGROUP_SIZE_Y, local_size_z = 1) in;
 
@@ -89,29 +84,30 @@ void load_tile_to_shared(uint tile_start_x, uint tile_start_y, uint ic_slice_sta
         int g_col = int(tile_start_x + col - 1);
 
         // channels are indexed in ivec4 units
-        uint g_ic_slice = ic_slice_start + ch;
-        uint g_row_stride = (p.num_ic / IC_SLICE) * p.width;
-        uint g_col_stride = (p.num_ic / IC_SLICE);
-
+        uint g_ic_slice = ic_slice_start / SIZE_OF_IVEC4 + ch;
+        uint g_row_stride = (p.num_ic / SIZE_OF_IVEC4) * p.width;
+        uint g_col_stride = (p.num_ic / SIZE_OF_IVEC4);
+  
         if (g_row >=0 && g_row < p.height && g_col >=0 && g_col < p.width)
         {
-            shmem.shared_tile_ivec4[linear_idx] = t_input[g_row * g_row_stride + g_col * g_col_stride + g_ic_slice];
+            shared_tile_ivec4[linear_idx] = t_input[g_row_stride * g_row + g_col_stride * g_col + g_ic_slice];
         }
         else
         {
-            shmem.shared_tile_ivec4[linear_idx] = ivec4(0);
+            shared_tile_ivec4[linear_idx] = ivec4(0);
         }
 
         linear_idx += WORKGROUP_SIZE;
     }
 }
 
+
 uint get_shmem_offset_3x3(uint p, uint subgroup_id) {
     uint row = p / 3;
     uint col = p % 3;
-    uint row_stride = TILE_SIZE_X_WITH_RING * IC_SLICE;
+    uint row_stride = TILE_SIZE_X_WITH_RING * IC_SLICE / SIZE_OF_IVEC4;
 
-    return (row + subgroup_id) * row_stride + col * IC_SLICE;
+    return (row + subgroup_id) * row_stride + col * IC_SLICE / SIZE_OF_IVEC4;
 }
 
 
@@ -124,16 +120,18 @@ void main() {
     uint tile_start_y = gl_WorkGroupID.y * TILE_SIZE_Y;
     uint tile_start_x = gl_WorkGroupID.x * TILE_SIZE_X;
 
-
     // Input slice loop
     for (uint os = 0; os < p.num_oc / OC_SLICE; ++os)
     {
-        mat_c = coopmat<int, gl_ScopeSubgroup, TILE_SIZE_X, OC_SLICE, gl_MatrixUseAccumulator>(0);
+        for (int i = 0; i < mat_c.length(); ++i)
+        {
+	        mat_c[i] = 0;
+        }
 
         for (uint is = 0; is < p.num_ic / IC_SLICE; ++is)
         {
             // 1. Load input slice to shared memory
-            load_tile_to_shared(tile_start_x, tile_start_y, is * IC_SLICE_IN_IVEC4);
+            load_tile_to_shared(tile_start_x, tile_start_y, is * IC_SLICE);
             barrier();
 
             for (uint k = 0; k < 9; ++k)
@@ -148,12 +146,10 @@ void main() {
                 coopMatLoad(mat_b, t_weight, offset, OC_SLICE, gl_CooperativeMatrixLayoutRowMajor);
 
                 // 4. Load matrix A for position p for row r 
-                coopMatLoad(mat_a, shmem.shared_tile_i8, get_shmem_offset_3x3(k, gl_LocalInvocationID.y), IC_SLICE, gl_CooperativeMatrixLayoutRowMajor);
-                barrier();
+                coopMatLoad(mat_a, shared_tile_ivec4, get_shmem_offset_3x3(k, gl_LocalInvocationID.y), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
 
                 // 5. Perform MMA and accumulate to mat_c[r]
                 mat_c = coopMatMulAdd(mat_a, mat_b, mat_c);
-                barrier();
             }
         }
 
@@ -163,8 +159,7 @@ void main() {
         uint orow = (tile_start_y + gl_LocalInvocationID.y);
         uint ocol = tile_start_x;
         uint output_offset = orow * OUT_ROW_STRIDE + ocol * OUT_COL_STRIDE + os * OC_SLICE;
-        //mat_c = coopmat<int, gl_ScopeSubgroup, TILE_SIZE_X, OC_SLICE, gl_MatrixUseAccumulator>(orow);
-        coopMatStore(mat_c, t_output, output_offset, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-        //t_output[output_offset] = 42;
+
+        coopMatStore(mat_c, t_output, output_offset, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor); 
     }
 }

@@ -15,7 +15,8 @@ use data::{array_exact_compare, create_tensor};
 
 use crate::data::{
     conv3x3_i8_acc_i32, copy_device_to_host, copy_host_to_device, dump_hwc_to_csv,
-    generate_random_data, reorder_weights_nchw,
+    generate_copy_conv3x3_weights, generate_copy1ch_conv3x3_weights, generate_random_data,
+    generate_row_number, reorder_weights_nchw,
 };
 use crate::device_buffer::DeviceBuffer;
 
@@ -85,6 +86,7 @@ fn get_required_device_extensions() -> Vec<*const i8> {
         vec![
             c"VK_KHR_cooperative_matrix".as_ptr(),
             c"VK_KHR_workgroup_memory_explicit_layout".as_ptr(),
+            c"VK_EXT_subgroup_size_control".as_ptr(),
         ]
     }
 }
@@ -181,16 +183,13 @@ fn create_vulkan_api() -> VulkanApi {
                 .workgroup_memory_explicit_layout(true)
                 .workgroup_memory_explicit_layout8_bit_access(true)
                 .workgroup_memory_explicit_layout_scalar_block_layout(true);
-
-        let mut shader_float16_int8_features =
-            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_int8(true);
+        // Add to device creation chain...
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info))
             .enabled_extension_names(&extension_names)
             .push_next(&mut features12)
             .push_next(&mut workgroup_layout_features)
-            .push_next(&mut shader_float16_int8_features)
             .push_next(&mut coop_matrix_features);
 
         // Create logical device
@@ -321,6 +320,9 @@ fn create_compute_pipeline(
         let pipeline_layout = device
             .create_pipeline_layout(&pipeline_layout_info, None)
             .expect("Cannot create pipeline layout");
+        let mut pipeline_shader_stage_required_subgroup_size =
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(32);
         let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
@@ -462,8 +464,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  Create device buffers
     // Input tensor
     let input_shape = [args.in_channels, args.height, args.width];
-    //let input_data = generate_random_data::<i8>(&input_shape);
-    let input_data = vec![1_i8; args.in_channels * args.height * args.width];
+    let input_data = generate_random_data::<i8>(&input_shape);
+    //let input_data = vec![1_i8; args.in_channels * args.height * args.width];
+    //let input_data = generate_row_number::<i8>(args.in_channels, args.height, args.width);
     let t_input = create_tensor::<i8>(device, &api.mem_props, &input_shape);
     let _ = copy_host_to_device(
         device,
@@ -477,6 +480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Weight tensor
     let weight_shape = [args.in_channels, args.out_channels, 3, 3];
     let weight_data = generate_random_data::<i8>(&weight_shape);
+    // let weight_data = generate_copy_conv3x3_weights::<i8>(weight_shape[0]);
     // let weight_data = vec![1_i8; args.in_channels * args.out_channels * 9];
     let mut weight_reordered_data = vec![0_i8; weight_data.len()];
     reorder_weights_nchw(
@@ -605,8 +609,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_execution_time_ns(device, api.query_pool, api.props.limits.timestamp_period);
 
         println!("Dispatch took: {:.3} ms", gpu_time / 1e6);
-
-        device.destroy_descriptor_pool(api.desc_pool, None);
     }
 
     let num_output_elements = args.width * args.height * args.out_channels;
@@ -639,7 +641,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //println!("CPU elements: {:?}", &host_output);
     //println!("GPU elements: {:?}", &gpu_output);
     //println!("Some elements GPU: {:?}", &gpu_output[0..]);
-    // dump_tensor_to_csv(&gpu_output, args.width, args.out_channels, "gpu_out.csv");
+    dump_hwc_to_csv(&gpu_output, args.width, args.out_channels, "gpu_out.csv");
+    dump_hwc_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv");
+    dump_hwc_to_csv(&input_data, args.width, args.out_channels, "gpu_in.csv");
     // dump_tensor_to_csv(&host_output, args.width, args.out_channels, "cpu_out.csv");
 
     // RenderDoc
@@ -650,6 +654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_output.destroy(device);
         t_weight.destroy(device);
 
+        device.destroy_descriptor_pool(api.desc_pool, None);
         device.destroy_descriptor_set_layout(desc_set_layout, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_pipeline(pipeline, None);

@@ -168,6 +168,44 @@ where
     data
 }
 
+pub fn generate_copy_conv3x3_weights<T: Copy + From<i8>>(ic: usize) -> Vec<T> {
+    let mut data: Vec<T> = vec![T::from(0_i8); ic * ic * 9];
+    let dx = 1;
+    let dy = 1;
+
+    for c in 0..ic {
+        data[c * ic * 3 * 3 + c * 3 * 3 + dy * 3 + dx] = T::from(1_i8);
+    }
+
+    data
+}
+
+pub fn generate_copy1ch_conv3x3_weights<T: Copy + From<i8>>(ic: usize) -> Vec<T> {
+    let mut data: Vec<T> = vec![T::from(0_i8); ic * ic * 9];
+    let dx = 1;
+    let dy = 1;
+
+    for c in 0..ic {
+        data[c * ic * 3 * 3 + 0 * 3 * 3 + dy * 3 + dx] = T::from(1_i8);
+    }
+
+    data
+}
+
+pub fn generate_row_number<T: Copy + From<i8>>(ic: usize, height: usize, width: usize) -> Vec<T> {
+    let mut data: Vec<T> = vec![T::from(0_i8); ic * width * height];
+
+    for i in 0..ic {
+        for h in 0..height {
+            for w in 0..width {
+                data[h * width * ic + w * ic + i] = T::from(h as i8);
+            }
+        }
+    }
+
+    data
+}
+
 pub fn conv3x3_i8_acc_i32(
     input_shape: &[usize],
     output_shape: &[usize],
@@ -269,7 +307,12 @@ pub fn reorder_weights_nchw<T: Copy>(
     }
 }
 
-pub fn dump_hwc_to_csv(data: &[i32], width: usize, channels: usize, path: &str) -> io::Result<()> {
+pub fn dump_hwc_to_csv<T: std::fmt::Display>(
+    data: &[T],
+    width: usize,
+    channels: usize,
+    path: &str,
+) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
