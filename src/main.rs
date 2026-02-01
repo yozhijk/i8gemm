@@ -83,11 +83,7 @@ fn get_required_device_extensions() -> Vec<*const i8> {
     if cfg!(target_os = "macos") {
         vec![c"VK_KHR_portability_subset".as_ptr()]
     } else {
-        vec![
-            c"VK_KHR_cooperative_matrix".as_ptr(),
-            c"VK_KHR_workgroup_memory_explicit_layout".as_ptr(),
-            c"VK_EXT_subgroup_size_control".as_ptr(),
-        ]
+        vec![c"VK_KHR_cooperative_matrix".as_ptr()]
     }
 }
 
@@ -101,15 +97,12 @@ fn get_required_instance_flags() -> vk::InstanceCreateFlags {
 
 fn print_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk::PhysicalDevice) {
     unsafe {
-        // 1. Load the Extension Helper
         let coop_mat_fn = ash::khr::cooperative_matrix::Instance::new(entry, instance);
 
-        // 2. Query Properties
         let props = coop_mat_fn
             .get_physical_device_cooperative_matrix_properties(pdevice)
             .expect("Failed to query cooperative matrix properties");
 
-        // 3. Find your specific configuration
         for p in props {
             if p.a_type == vk::ComponentTypeKHR::SINT8
                 && p.c_type == vk::ComponentTypeKHR::SINT32
@@ -126,12 +119,10 @@ fn print_supported_matrix_sizes(entry: &Entry, instance: &Instance, pdevice: vk:
 
 fn create_vulkan_api(num_queries: u32) -> VulkanApi {
     unsafe {
-        // Load Vulkan Entry
         // (This loads the Vulkan dynamic library from the system)
         let entry = Entry::load().expect("Cannot create Vulkan entry");
 
-        // Create Instance
-        // We request Vulkan 1.3 because of Cooperative Matrix
+        // We request Vulkan 1.3 because of Cooperative Matrix.
         let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
 
         let layer_names = get_required_layers();
@@ -146,7 +137,7 @@ fn create_vulkan_api(num_queries: u32) -> VulkanApi {
             .create_instance(&instance_create_info, None)
             .expect("Cannot create Vulkan instance");
 
-        // Pick Physical Device (GPU), just pick the first one
+        // Pick physical device, just pick the first one.
         let pdevices = instance
             .enumerate_physical_devices()
             .expect("Cannot enumerate physical devices");
@@ -166,10 +157,8 @@ fn create_vulkan_api(num_queries: u32) -> VulkanApi {
             .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priorities);
 
-        // --- FP8 GEMM SPECIFIC SETUP START ---
         let extension_names = get_required_device_extensions();
 
-        // 1. Vulkan 1.2 Features (Required for VulkanMemoryModel)
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .vulkan_memory_model(true) // Fixes Error 2
             .shader_float16(true) // Likely needed for tensor ops
@@ -179,27 +168,18 @@ fn create_vulkan_api(num_queries: u32) -> VulkanApi {
             .host_query_reset(true);
         let mut coop_matrix_features =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
-        let mut workgroup_layout_features =
-            vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
-                .workgroup_memory_explicit_layout(true)
-                .workgroup_memory_explicit_layout8_bit_access(true)
-                .workgroup_memory_explicit_layout_scalar_block_layout(true);
-        // Add to device creation chain...
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info))
             .enabled_extension_names(&extension_names)
             .push_next(&mut features12)
-            .push_next(&mut workgroup_layout_features)
             .push_next(&mut coop_matrix_features);
 
-        // Create logical device
         let device = instance
             .create_device(*pdevice, &device_create_info, None)
             .expect("Cannot create Vulkan device");
         let queue = device.get_device_queue(queue_family_index, 0);
 
-        // Get supported matrix sizes
         print_supported_matrix_sizes(&entry, &instance, *pdevice);
 
         let pool_create_info =
@@ -209,7 +189,6 @@ fn create_vulkan_api(num_queries: u32) -> VulkanApi {
             .expect("Cannot create command pool");
         let mem_props = instance.get_physical_device_memory_properties(*pdevice);
 
-        // Create descriptor pool for our buffers
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(128)];
@@ -297,18 +276,18 @@ fn create_compute_pipeline(
     desc_set_layout: &DescriptorSetLayout,
 ) -> (vk::Pipeline, vk::PipelineLayout) {
     unsafe {
-        // Load SPIRV
-        // Note: This path is relative to the file where this macro is called (src/main.rs)
+        // Load SPIRV.
+        // Note: This path is relative to the file where this macro is called (src/main.rs).
         let shader_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/conv3x3.coopmat.comp.spv"));
         let shader_code = read_spv(&mut Cursor::new(shader_bytes)).unwrap();
 
-        // Create shader module
+        // Create shader module.
         let shader_module_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
         let shader_module = device
             .create_shader_module(&shader_module_info, None)
             .expect("Error creating shader module");
 
-        // Create pipeline layout
+        // Create pipeline layout.
         let desc_set_layouts = [*desc_set_layout];
         let push_constants_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -405,7 +384,6 @@ pub fn get_execution_time_ns(
     valid_bits: u32,
 ) -> f64 {
     unsafe {
-        // Array to hold the two 64-bit timestamps
         let mut timestamps = [0u64; 2];
 
         // Fetch results from the GPU
@@ -430,7 +408,6 @@ pub fn get_execution_time_ns(
                     (1u64 << valid_bits) - 1
                 };
 
-                // Apply mask before subtraction
                 let delta_ticks = (end & mask).wrapping_sub(start & mask) & mask;
 
                 (delta_ticks as f64) * (timestamp_period as f64)
@@ -500,12 +477,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = &api.device;
     let queue = api.queue;
 
-    // Create compute pipeline
+    // Create compute pipeline.
     let desc_set_layout = create_descriptor_set_layout(device);
     let (pipeline, pipeline_layout) = create_compute_pipeline(device, &desc_set_layout);
 
-    //  Create device buffers
-    // Input tensor
+    // Create device buffers.
+    // Input tensor.
     let input_shape = [args.in_channels, args.height, args.width];
     let input_data = generate_random_data::<i8>(&input_shape);
     //let input_data = vec![1_i8; args.in_channels * args.height * args.width];
@@ -520,7 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &api.mem_props,
     );
 
-    // Weight TILE_SIZE
+    // Weight TILE_SIZE.
     let weight_shape = [args.in_channels, args.out_channels, 3, 3];
     let weight_data = generate_random_data::<i8>(&weight_shape);
     // let weight_data = generate_copy_conv3x3_weights::<i8>(weight_shape[0]);
@@ -545,11 +522,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &api.mem_props,
     );
 
-    // Output tensor
+    // Output tensor.
     let output_shape = [args.out_channels, args.height, args.width];
     let t_output = create_tensor::<i32>(device, &api.mem_props, &output_shape);
 
-    // Create descriptor set for our buffers
+    // Create descriptor set for our buffers.
     let desc_set = create_descriptor_set(
         device,
         desc_set_layout,
@@ -559,18 +536,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &t_output,
     );
 
-    // Run compute pass
     unsafe {
+        device.reset_query_pool(api.query_pool, 0, 2 * args.tests as u32);
+
         for t in 0..args.tests {
             let allocate_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(api.command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
-
-            if t == 0 {
-                device.reset_query_pool(api.query_pool, 0, 2 * args.tests as u32);
-            }
-
             let command_buffer = device.allocate_command_buffers(&allocate_info).unwrap()[0];
 
             let begin_info = vk::CommandBufferBeginInfo::default()
@@ -580,17 +553,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .begin_command_buffer(command_buffer, &begin_info)
                 .unwrap();
 
-            // Bind Pipeline
+            // Bind Pipeline.
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
 
-            // Bind Descriptors
+            // Bind Descriptors.
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 pipeline_layout,
-                0, // First set index
+                0,
                 &[desc_set],
-                &[], // Dynamic offsets
+                &[],
             );
 
             let constants = PushConstants {
@@ -621,13 +594,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 2 * t as u32,
             );
 
-            // Calculate Dispatch Dimensions
-            // CAUTION: This depends entirely on your shader's local_size_x/y
+            // Tile size is set for Intel Lunar Lake.
             let tile_size = (8, 4);
             let group_count_x = args.width.div_ceil(tile_size.0);
             let group_count_y = args.height.div_ceil(tile_size.1);
 
-            // Dispatch
             device.cmd_dispatch(
                 command_buffer,
                 group_count_x as u32,
@@ -644,7 +615,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             device.end_command_buffer(command_buffer).unwrap();
 
-            // --- 4. Submit and Wait ---
             let cmd_buffers = [command_buffer];
             let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
             device
@@ -680,6 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let num_output_elements = args.width * args.height * args.out_channels;
     let mut gpu_output = vec![0; num_output_elements];
+
     // Download data
     let _ = copy_device_to_host(
         device,
