@@ -598,17 +598,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tile_size = (8, 4);
             let group_count_x = args.width.div_ceil(tile_size.0);
             let group_count_y = args.height.div_ceil(tile_size.1);
+            //let group_count_z = args.out_channels.div_ceil(16);
 
             device.cmd_dispatch(
                 command_buffer,
                 group_count_x as u32,
                 group_count_y as u32,
-                1,
+                1, //group_count_z as u32,
+            );
+
+            let output_write_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .buffer(t_output.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::default(),
+                &[],
+                &[output_write_barrier],
+                &[],
             );
 
             device.cmd_write_timestamp(
                 command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 api.query_pool,
                 2 * t as u32 + 1,
             );
