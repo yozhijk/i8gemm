@@ -594,17 +594,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 2 * t as u32,
             );
 
-            // Tile size is set for Intel Lunar Lake.
-            let tile_size = (8, 4);
+            // Tile size matches shader: 32x4 spatial with 4 subgroups
+            let tile_size = (32, 4);
             let group_count_x = args.width.div_ceil(tile_size.0);
             let group_count_y = args.height.div_ceil(tile_size.1);
-            //let group_count_z = args.out_channels.div_ceil(16);
+            let group_count_z = args.out_channels / 16;
 
             device.cmd_dispatch(
                 command_buffer,
                 group_count_x as u32,
                 group_count_y as u32,
-                1, //group_count_z as u32,
+                group_count_z as u32,
             );
 
             let output_write_barrier = vk::BufferMemoryBarrier::default()

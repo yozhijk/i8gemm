@@ -7,11 +7,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 #extension GL_EXT_shader_8bit_storage: require
 
-const int TILE_SIZE_X = 8;
+// Intel Lunar Lake MMA primitive: 8x32x16 (M=8, K=32, N=16)
+// 32x4 tile - best config, each subgroup computes 4 adjacent 8-wide outputs
+
+const int TILE_SIZE_X = 32;
 const int TILE_SIZE_Y = 4;
 const int TILE_SIZE_X_WITH_RING = TILE_SIZE_X + 2;
 const int TILE_SIZE_Y_WITH_RING = TILE_SIZE_Y + 2;
-const int TILE_SIZE = TILE_SIZE_X * TILE_SIZE_Y;
 const int TILE_SIZE_WITH_RING = TILE_SIZE_X_WITH_RING * TILE_SIZE_Y_WITH_RING;
 
 const int WORKGROUP_SIZE_X = 32;
@@ -22,9 +24,9 @@ const int SIZE_OF_IVEC4 = 16;
 const int IC_SLICE = 32;
 const int OC_SLICE = 16;
 const int IC_SLICE_IN_IVEC4 = IC_SLICE / SIZE_OF_IVEC4;
-const int OC_SLICE_IN_IVEC4 = OC_SLICE / SIZE_OF_IVEC4;
 
-// 3D tensor TILE_SIZE_Y_WITH_RING x TILE_SIZE_X_WITH_RING x IC_SLIZE 
+const int MMA_M = 8; 
+
 const int INPUT_TILE_SIZE_IN_BYTES = TILE_SIZE_WITH_RING * IC_SLICE;
 const int INPUT_TILE_SIZE_IN_IVEC4 = INPUT_TILE_SIZE_IN_BYTES / SIZE_OF_IVEC4;
 
@@ -32,7 +34,6 @@ shared ivec4 shared_tile_ivec4[INPUT_TILE_SIZE_IN_IVEC4];
 
 layout(local_size_x = WORKGROUP_SIZE_X, local_size_y = WORKGROUP_SIZE_Y, local_size_z = 1) in;
 
-// Input / output bindings
 layout(set = 0, binding = 0) readonly buffer Input {
     ivec4 t_input[]; 
 };
@@ -55,29 +56,19 @@ layout(push_constant) uniform PushConsts {
 
 void load_tile_to_shared(uint tile_start_x, uint tile_start_y, uint ic_slice_start)
 {
-    // Input is in HWC, each channel slice is consecutive chunk of SIZE_OF_IVEC4 * IC_SLICE / 16 bytes
-    // ic_slice is 0..(num_input_channels / IC_SLICE)-1
     uint linear_idx = gl_LocalInvocationID.y * WORKGROUP_SIZE_X + gl_LocalInvocationID.x;
+    uint g_row_stride = (p.num_ic / SIZE_OF_IVEC4) * p.width;
+    uint g_col_stride = (p.num_ic / SIZE_OF_IVEC4);
 
-    // we need to load INPUT_TILE_SIZE_IN_IVEC4 ivec4 elements,
-    // in case of IC_SLICE == 16 we load the whole slice in single ivec4 load.
-    // but in general each slice needs IC_SLICE / SIZE_OF_IVEC4 loads.
-    // it makes sense to assume IC_SLICE >= SIZE_OF_IVEC4.
-    while (linear_idx < INPUT_TILE_SIZE_IN_IVEC4)
+    for (; linear_idx < INPUT_TILE_SIZE_IN_IVEC4; linear_idx += WORKGROUP_SIZE)
     {
-        // calculate local row col and channel for current linear_idx
         uint row = linear_idx / (TILE_SIZE_X_WITH_RING * IC_SLICE_IN_IVEC4);
         uint col = (linear_idx % (TILE_SIZE_X_WITH_RING * IC_SLICE_IN_IVEC4)) / IC_SLICE_IN_IVEC4;
         uint ch  = (linear_idx % (TILE_SIZE_X_WITH_RING * IC_SLICE_IN_IVEC4)) % IC_SLICE_IN_IVEC4;
 
-        // calculate global row col and channel
         int g_row = int(tile_start_y + row - 1);
         int g_col = int(tile_start_x + col - 1);
-
-        // channels are indexed in ivec4 units
         uint g_ic_slice = ic_slice_start / SIZE_OF_IVEC4 + ch;
-        uint g_row_stride = (p.num_ic / SIZE_OF_IVEC4) * p.width;
-        uint g_col_stride = (p.num_ic / SIZE_OF_IVEC4);
   
         if (g_row >=0 && g_row < p.height && g_col >=0 && g_col < p.width)
         {
@@ -87,99 +78,100 @@ void load_tile_to_shared(uint tile_start_x, uint tile_start_y, uint ic_slice_sta
         {
             shared_tile_ivec4[linear_idx] = ivec4(0);
         }
-
-        linear_idx += WORKGROUP_SIZE;
     }
 }
 
 
-// Get offset in ivec4 elements of a matrix corresponding to 
-// p kernel position for subgroup_id row of pixels. 
-uint get_shmem_offset_3x3(uint p, uint subgroup_id) {
-    uint row = p / 3;
-    uint col = p % 3;
+// Get shared memory offset for 3x3 kernel position k
+// For 16-wide tile, x_offset selects which 8-wide half (0 or 8)
+uint get_shmem_offset_3x3(uint k, uint subgroup_id, uint x_offset) {
+    uint row = k / 3;
+    uint col = k % 3;
     uint row_stride = TILE_SIZE_X_WITH_RING * IC_SLICE / SIZE_OF_IVEC4;
-
-    return (row + subgroup_id) * row_stride + col * IC_SLICE / SIZE_OF_IVEC4;
+    return (row + subgroup_id) * row_stride + (col + x_offset) * IC_SLICE / SIZE_OF_IVEC4;
 }
 
 
-// Tiled implicit Conv3x3 kernel. 
-// Runs TILE_SIZE_Y subgroups, each subgroup is responsible for TILE_SIZE_X input pixels,
-// each represented by IC_SLICE input channels. I.e. each subgroup runs 9
-// (TILE_SIZE_X x IC_SLICE) @ (IC_SLIICE x OC_SLICE) MMA primtives (for each spatial kernel position).
-// Whole group handles TILE_SIZE_X x TILE_SIZE_Y input pixels tile. 
-// The group iterates over input slices. Output slices can be either iterated as well or 
-// mapped to  Z workgroup coordinate and run in parallel.
 void main() {
-    // These matrices essentially occupy size * gl_NumSubgroups
-    coopmat<int8_t, gl_ScopeSubgroup, TILE_SIZE_X, IC_SLICE, gl_MatrixUseA> mat_a;
-    coopmat<int8_t, gl_ScopeSubgroup, IC_SLICE, OC_SLICE, gl_MatrixUseB> mat_b;
-    coopmat<int, gl_ScopeSubgroup, TILE_SIZE_X, OC_SLICE, gl_MatrixUseAccumulator> mat_c;
+    // Four sets of matrices for 4 parts of the 32-wide tile
+    // |---------|----------|---------|----------|  
+    // |    A0   |    A1    |    A2   |    A3    | 
+    // |---------|----------|---------|----------| 
+    //                                             
 
-    // The kernel handles TILE_SIZE_X x TILE_SIZE_Y tile by chunking input and output channels
-    // w.r.t to MMA primitive size. 
+    coopmat<int8_t, gl_ScopeSubgroup, MMA_M, IC_SLICE, gl_MatrixUseA> mat_a0;
+    coopmat<int8_t, gl_ScopeSubgroup, MMA_M, IC_SLICE, gl_MatrixUseA> mat_a1;
+    coopmat<int8_t, gl_ScopeSubgroup, MMA_M, IC_SLICE, gl_MatrixUseA> mat_a2;
+    coopmat<int8_t, gl_ScopeSubgroup, MMA_M, IC_SLICE, gl_MatrixUseA> mat_a3;
+    coopmat<int8_t, gl_ScopeSubgroup, IC_SLICE, OC_SLICE, gl_MatrixUseB> mat_b;
+    coopmat<int, gl_ScopeSubgroup, MMA_M, OC_SLICE, gl_MatrixUseAccumulator> mat_c0;
+    coopmat<int, gl_ScopeSubgroup, MMA_M, OC_SLICE, gl_MatrixUseAccumulator> mat_c1;
+    coopmat<int, gl_ScopeSubgroup, MMA_M, OC_SLICE, gl_MatrixUseAccumulator> mat_c2;
+    coopmat<int, gl_ScopeSubgroup, MMA_M, OC_SLICE, gl_MatrixUseAccumulator> mat_c3;
+
     uint tile_start_y = gl_WorkGroupID.y * TILE_SIZE_Y;
     uint tile_start_x = gl_WorkGroupID.x * TILE_SIZE_X;
 
+    uint subgroup_id = gl_LocalInvocationID.y;
+    uint tile_z = gl_WorkGroupID.z;
+
+    // Precompute strides
+    uint P_STRIDE = IC_SLICE * OC_SLICE;
+    uint IC_STRIDE = P_STRIDE * 9;
+    uint OC_STRIDE = IC_STRIDE * (p.num_ic / IC_SLICE);
+
+    uint num_oc_slices = p.num_oc / OC_SLICE;
+    uint num_ic_slices = p.num_ic / IC_SLICE;
+
+    // Precompute output strides
+    uint OUT_COL_STRIDE = p.num_oc;
+    uint OUT_ROW_STRIDE = p.width * OUT_COL_STRIDE; 
+    uint orow = tile_start_y + subgroup_id;
+    uint output_base = orow * OUT_ROW_STRIDE + tile_start_x * OUT_COL_STRIDE;
+
     // Output slice loop
-    // TODO: this can be mapped to WG z coordinated in order 
-    // to reuse input tile cached in shared memory for multiple output slices.
-    // Try this. 
-    for (uint os = 0; os < p.num_oc / OC_SLICE; ++os)
+    //for (uint os = 0; os < num_oc_slices; ++os)
+    uint os = tile_z;
     {
-        // Clear C matrix.
-        for (int i = 0; i < mat_c.length(); ++i)
+        // Clear C matrices
+        for (int i = 0; i < mat_c0.length(); ++i)
         {
-	        mat_c[i] = 0;
+            mat_c0[i] = 0;
+            mat_c1[i] = 0;
+            mat_c2[i] = 0;
+            mat_c3[i] = 0;
         }
 
+        uint weight_os_base = os * OC_STRIDE;
+
         // Input tile loop
-        for (uint is = 0; is < p.num_ic / IC_SLICE; ++is)
+        for (uint is = 0; is < num_ic_slices; ++is)
         {
-            // Load input channels slice to shared memory.
             load_tile_to_shared(tile_start_x, tile_start_y, is * IC_SLICE);
             barrier();
 
-            // Iterate over kernel weight for each spatial position (3x3)
+            uint weight_is_offset = weight_os_base + is * IC_STRIDE;
+
+            // Unrolled 3x3 kernel - load all 4 parts
             for (uint k = 0; k < 9; ++k)
             {
-                // Load matrix B for position p of the kernel from memory (weight matrix)
-                // weights are laid out in NUM_OUT_SLICESxNUM_INPUT_SLICESxKxKxIC_SLICExOC_SLICE
-                // (64, 64, 3, 3) -> (4, 4, 3, 3, 16, 16).
-
-                // Stride between kernel positions
-                uint P_STRIDE = IC_SLICE * OC_SLICE;
-                // Stride between input slices
-                uint IC_STRIDE = P_STRIDE * 9;
-                // Stride between output slices
-                uint OC_STRIDE  = IC_STRIDE * (p.num_ic / IC_SLICE);
-
-                uint offset = os * OC_STRIDE + is * IC_STRIDE + k * P_STRIDE;
-                coopMatLoad(mat_b, t_weight, offset, OC_SLICE, gl_CooperativeMatrixLayoutRowMajor);
-
-                // Load matrix A for position p:
-                // each workgroup row (subgroup) loads different row of pixels from shared memory,
-                // accounting for 3x3 kernel spatial offset.
-                coopMatLoad(mat_a, shared_tile_ivec4, get_shmem_offset_3x3(k, gl_LocalInvocationID.y), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
-
-                // Perform MMA and accumulate to mat_c.
-                mat_c = coopMatMulAdd(mat_a, mat_b, mat_c);
+                coopMatLoad(mat_a0, shared_tile_ivec4, get_shmem_offset_3x3(k, subgroup_id, 0), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mat_a1, shared_tile_ivec4, get_shmem_offset_3x3(k, subgroup_id, 8), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mat_a2, shared_tile_ivec4, get_shmem_offset_3x3(k, subgroup_id, 16), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mat_a3, shared_tile_ivec4, get_shmem_offset_3x3(k, subgroup_id, 24), IC_SLICE / SIZE_OF_IVEC4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mat_b, t_weight, weight_is_offset + k * P_STRIDE, OC_SLICE, gl_CooperativeMatrixLayoutRowMajor);
+                mat_c0 = coopMatMulAdd(mat_a0, mat_b, mat_c0);
+                mat_c1 = coopMatMulAdd(mat_a1, mat_b, mat_c1);
+                mat_c2 = coopMatMulAdd(mat_a2, mat_b, mat_c2);
+                mat_c3 = coopMatMulAdd(mat_a3, mat_b, mat_c3);
             }
 
-            // Make sure not to overwrite input tile, while some warps are still doing MMAs.
             barrier();
         }
 
-        // Store output channel slice.
-        uint OUT_COL_STRIDE = p.num_oc;
-        uint OUT_ROW_STRIDE = p.width * OUT_COL_STRIDE; 
-
-        // Each subgroup stores different row of output data.
-        uint orow = (tile_start_y + gl_LocalInvocationID.y);
-        uint ocol = tile_start_x;
-        uint output_offset = orow * OUT_ROW_STRIDE + ocol * OUT_COL_STRIDE + os * OC_SLICE;
-
-        coopMatStore(mat_c, t_output, output_offset, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor); 
+        coopMatStore(mat_c0, t_output, output_base + os * OC_SLICE, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(mat_c1, t_output, output_base + 8 * OUT_COL_STRIDE + os * OC_SLICE, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(mat_c2, t_output, output_base + 16 * OUT_COL_STRIDE + os * OC_SLICE, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(mat_c3, t_output, output_base + 24 * OUT_COL_STRIDE + os * OC_SLICE, OUT_COL_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
     }
 }
